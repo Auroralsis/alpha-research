@@ -1,1 +1,9 @@
 GIT_COMMANDS.md
+PANDAS_DATAFRAME_GUIDE.md
+
+*.png
+
+data/raw/*
+data/interim/*
+data/processed/*
+.env
