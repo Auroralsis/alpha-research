@@ -6,6 +6,7 @@ from pathlib import Path
 
 project_root_dir = Path("/home/lxy/quant/alpha-research")
 raw_daily_dir = project_root_dir / "data" / "raw" / "daily"
+raw_output_path = raw_daily_dir / "daily_2024_test"
 raw_daily_dir.mkdir(parents=True, exist_ok=True)
 
 pro = ts.pro_api(os.environ["TUSHARE_TOKEN"])
@@ -28,8 +29,6 @@ df = pro.daily(ts_code=",".join(codes), start_date='20240101', end_date='2024123
 # df没有而adj_factor有就直接丢弃。
 adj_factor = pro.adj_factor(ts_code=",".join(codes), start_date='20240101', end_date='20241231')
 df = pd.merge(df, adj_factor, on=['ts_code', 'trade_date'], how='left')
-
-raw_output_path = raw_daily_dir / "daily_2024_test"
 
 df.to_parquet(raw_output_path, 
               index=False)
