@@ -1,0 +1,574 @@
+{
+  "stage": "P0",
+  "review_date": "2026-11-04",
+  "timezone": "Asia/Shanghai",
+  "scope": "Read-only audit of existing repository and local Parquet files; no provider API requests or trading implementation.",
+  "trading_ready": false,
+  "trusted_performance_available": false,
+  "runtime": {
+    "python": "3.13.11",
+    "pandas": "3.0.6",
+    "numpy": "2.5.3",
+    "pyarrow": "24.0.0",
+    "tushare": "1.4.29",
+    "scipy": "1.18.1",
+    "matplotlib": "3.11.2"
+  },
+  "unavailable_dependencies": [
+    "pytest",
+    "PyYAML",
+    "streamlit"
+  ],
+  "files": [
+    {
+      "path": "data/interim/daily/daily_2024_clean_csi",
+      "bytes": 3596280,
+      "sha256": "1b3a442697ba173bb7fb003002e7d68adf185441fb64ec74b8bb7bf07bdca64a",
+      "row_count": 144460,
+      "schema": {
+        "ts_code": "large_string",
+        "trade_date": "timestamp[us]",
+        "open": "double",
+        "high": "double",
+        "low": "double",
+        "close": "double",
+        "vol": "double",
+        "amount": "double",
+        "adj_factor": "double"
+      },
+      "null_counts": {
+        "ts_code": 0,
+        "trade_date": 0,
+        "open": 0,
+        "high": 0,
+        "low": 0,
+        "close": 0,
+        "vol": 0,
+        "amount": 0,
+        "adj_factor": 0
+      },
+      "code_column": "ts_code",
+      "unique_codes": 598,
+      "date_column": "trade_date",
+      "date_min": "2024-01-02",
+      "date_max": "2024-12-31",
+      "unique_dates": 242,
+      "duplicate_keys": 0,
+      "invalid_ohlc_rows": 0,
+      "negative_volume_or_amount_rows": 0,
+      "zero_volume_rows": 0
+    },
+    {
+      "path": "data/processed/daily/processed_2024_clean_csi",
+      "bytes": 11659901,
+      "sha256": "c70628c24e3dad9c331998db596fa3789fcbc28adc3ef0a8c6a036c30c403c62",
+      "row_count": 144460,
+      "schema": {
+        "ticker": "large_string",
+        "trade_date": "timestamp[us]",
+        "open": "double",
+        "high": "double",
+        "low": "double",
+        "close": "double",
+        "vol": "double",
+        "amount": "double",
+        "adj_factor": "double",
+        "open_hfq": "double",
+        "open_qfq": "double",
+        "high_hfq": "double",
+        "high_qfq": "double",
+        "low_hfq": "double",
+        "low_qfq": "double",
+        "close_hfq": "double",
+        "close_qfq": "double"
+      },
+      "null_counts": {
+        "ticker": 0,
+        "trade_date": 0,
+        "open": 0,
+        "high": 0,
+        "low": 0,
+        "close": 0,
+        "vol": 0,
+        "amount": 0,
+        "adj_factor": 0,
+        "open_hfq": 0,
+        "open_qfq": 0,
+        "high_hfq": 0,
+        "high_qfq": 0,
+        "low_hfq": 0,
+        "low_qfq": 0,
+        "close_hfq": 0,
+        "close_qfq": 0
+      },
+      "code_column": "ticker",
+      "unique_codes": 598,
+      "date_column": "trade_date",
+      "date_min": "2024-01-02",
+      "date_max": "2024-12-31",
+      "unique_dates": 242,
+      "duplicate_keys": 0,
+      "invalid_ohlc_rows": 0,
+      "negative_volume_or_amount_rows": 0,
+      "zero_volume_rows": 0
+    },
+    {
+      "path": "data/processed/factors/factor_data",
+      "bytes": 6855776,
+      "sha256": "445de24a619fa6ac3ce2c798ae6a3d5c163a7acb6bc99c830a193e51f683eec1",
+      "row_count": 96620,
+      "schema": {
+        "ticker": "large_string",
+        "trade_date": "timestamp[us]",
+        "mom_5": "double",
+        "mom_10": "double",
+        "mom_20": "double",
+        "mom_60": "double",
+        "future_ret_1": "double",
+        "future_ret_5": "double",
+        "future_ret_10": "double",
+        "future_ret_20": "double"
+      },
+      "null_counts": {
+        "ticker": 0,
+        "trade_date": 0,
+        "mom_5": 0,
+        "mom_10": 0,
+        "mom_20": 0,
+        "mom_60": 0,
+        "future_ret_1": 0,
+        "future_ret_5": 0,
+        "future_ret_10": 0,
+        "future_ret_20": 0
+      },
+      "code_column": "ticker",
+      "unique_codes": 598,
+      "date_column": "trade_date",
+      "date_min": "2024-04-03",
+      "date_max": "2024-12-03",
+      "unique_dates": 162,
+      "duplicate_keys": 0
+    },
+    {
+      "path": "data/processed/universe/csi500_membership.parquet",
+      "bytes": 8556557,
+      "sha256": "fd941cfaa034e647e09da09a20d00a1c34128ce74e8add7c808aa295b75a60d9",
+      "row_count": 1215000,
+      "schema": {
+        "ticker": "large_string",
+        "weight": "double",
+        "trade_date": "timestamp[us]",
+        "source_snapshot_date": "timestamp[us]",
+        "__index_level_0__": "int64"
+      },
+      "null_counts": {
+        "ticker": 0,
+        "weight": 0,
+        "trade_date": 0,
+        "source_snapshot_date": 0
+      },
+      "code_column": "ticker",
+      "unique_codes": 1263,
+      "date_column": "trade_date",
+      "date_min": "2016-01-04",
+      "date_max": "2025-12-31",
+      "unique_dates": 2430,
+      "duplicate_keys": 0
+    },
+    {
+      "path": "data/raw/calender/trade_calender_2016_2025.parquet",
+      "bytes": 28504,
+      "sha256": "86288b88767f0e0760bd1c58e0051a9ab7303c7455cbb556c996d7119f6ccd76",
+      "row_count": 2430,
+      "schema": {
+        "exchange": "large_string",
+        "cal_date": "large_string",
+        "is_open": "int64",
+        "pretrade_date": "large_string"
+      },
+      "null_counts": {
+        "exchange": 0,
+        "cal_date": 0,
+        "is_open": 0,
+        "pretrade_date": 0
+      },
+      "date_column": "cal_date",
+      "date_min": "2016-01-04",
+      "date_max": "2025-12-31",
+      "unique_dates": 2430,
+      "duplicate_keys": 0
+    },
+    {
+      "path": "data/raw/daily/daily_2024_csi",
+      "bytes": 3626351,
+      "sha256": "5c2d8e785cf2a2c951a6ae253ebe3391555d729dde03fe7f228b5324eda5a9f5",
+      "row_count": 144460,
+      "schema": {
+        "ts_code": "large_string",
+        "trade_date": "large_string",
+        "open": "double",
+        "high": "double",
+        "low": "double",
+        "close": "double",
+        "vol": "double",
+        "amount": "double",
+        "adj_factor": "double"
+      },
+      "null_counts": {
+        "ts_code": 0,
+        "trade_date": 0,
+        "open": 0,
+        "high": 0,
+        "low": 0,
+        "close": 0,
+        "vol": 0,
+        "amount": 0,
+        "adj_factor": 0
+      },
+      "code_column": "ts_code",
+      "unique_codes": 598,
+      "date_column": "trade_date",
+      "date_min": "2024-01-02",
+      "date_max": "2024-12-31",
+      "unique_dates": 242,
+      "duplicate_keys": 0,
+      "invalid_ohlc_rows": 0,
+      "negative_volume_or_amount_rows": 0,
+      "zero_volume_rows": 0
+    },
+    {
+      "path": "data/raw/universe/csi500_weight_snapshots.parquet",
+      "bytes": 167917,
+      "sha256": "5cd0d29472a035ec34d8be566cea8882f2cfbae75e3c179c5daa3a57a920d9fc",
+      "row_count": 61000,
+      "schema": {
+        "con_code": "large_string",
+        "trade_date": "large_string",
+        "weight": "double",
+        "index_code": "large_string"
+      },
+      "null_counts": {
+        "con_code": 0,
+        "trade_date": 0,
+        "weight": 0,
+        "index_code": 0
+      },
+      "code_column": "con_code",
+      "unique_codes": 1264,
+      "date_column": "trade_date",
+      "date_min": "2015-12-31",
+      "date_max": "2026-01-30",
+      "unique_dates": 122,
+      "duplicate_keys": 0
+    }
+  ],
+  "cross_checks": {
+    "daily_codes_equal_2024_membership_union": true,
+    "raw_processed_keys_equal": true,
+    "required_2024_member_days": 121000,
+    "unexplained_missing_2024_member_days": 66,
+    "codes_with_missing_member_days": 11,
+    "missing_member_days": [
+      {
+        "ts_code": "600282.SH",
+        "trade_date": "2024-01-12"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-17"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-18"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-19"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-22"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-23"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-24"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-25"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-04-26"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-26"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-04-29"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-29"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-04-30"
+      },
+      {
+        "ts_code": "000559.SZ",
+        "trade_date": "2024-04-30"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-06"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-07"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-08"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-09"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-10"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-13"
+      },
+      {
+        "ts_code": "601456.SH",
+        "trade_date": "2024-05-14"
+      },
+      {
+        "ts_code": "002092.SZ",
+        "trade_date": "2024-05-20"
+      },
+      {
+        "ts_code": "601298.SH",
+        "trade_date": "2024-07-10"
+      },
+      {
+        "ts_code": "601298.SH",
+        "trade_date": "2024-07-11"
+      },
+      {
+        "ts_code": "601298.SH",
+        "trade_date": "2024-07-12"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-07-25"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-07-26"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-07-29"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-07-30"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-07-31"
+      },
+      {
+        "ts_code": "600535.SH",
+        "trade_date": "2024-08-01"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-08-01"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-08-02"
+      },
+      {
+        "ts_code": "600535.SH",
+        "trade_date": "2024-08-02"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-08-05"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-08-06"
+      },
+      {
+        "ts_code": "600157.SH",
+        "trade_date": "2024-08-07"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-09-30"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-08"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-09"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-10"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-11"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-14"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-15"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-16"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-17"
+      },
+      {
+        "ts_code": "000958.SZ",
+        "trade_date": "2024-10-18"
+      },
+      {
+        "ts_code": "002064.SZ",
+        "trade_date": "2024-10-29"
+      },
+      {
+        "ts_code": "002064.SZ",
+        "trade_date": "2024-10-30"
+      },
+      {
+        "ts_code": "603305.SH",
+        "trade_date": "2024-10-30"
+      },
+      {
+        "ts_code": "603305.SH",
+        "trade_date": "2024-10-31"
+      },
+      {
+        "ts_code": "002064.SZ",
+        "trade_date": "2024-10-31"
+      },
+      {
+        "ts_code": "603305.SH",
+        "trade_date": "2024-11-01"
+      },
+      {
+        "ts_code": "002064.SZ",
+        "trade_date": "2024-11-01"
+      },
+      {
+        "ts_code": "603305.SH",
+        "trade_date": "2024-11-04"
+      },
+      {
+        "ts_code": "603305.SH",
+        "trade_date": "2024-11-05"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-11-25"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-11-26"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-11-27"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-11-28"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-11-29"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-12-02"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-12-03"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-12-04"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-12-05"
+      },
+      {
+        "ts_code": "603160.SH",
+        "trade_date": "2024-12-06"
+      }
+    ],
+    "membership_max_snapshot_lag_calendar_days": 35,
+    "membership_future_snapshot_rows": 0,
+    "membership_daily_size_min": 500,
+    "membership_daily_size_max": 500,
+    "membership_max_weight_sum_error_percentage_points": 0.019000000000005457,
+    "adj_factor_change_rows": 813,
+    "codes_with_adj_factor_changes": 527,
+    "implied_average_price_outside_ohlc_tolerance_0_011_cny": 0,
+    "qfq_formula_max_abs_error": 0.0,
+    "stored_mom20_matches_existing_formula": true,
+    "constant_qfq_anchor_cancels_in_momentum": true
+  },
+  "blockers": [
+    "No available_at or historical revision evidence; strict historical PIT is unverified.",
+    "Monthly index snapshots do not prove exact historical adjustment/effective dates.",
+    "66 constituent-day OHLCV gaps lack suspension evidence.",
+    "No trading calendar or usable current market coverage for 2026 forward trading.",
+    "No daily price limits, suspension states, historical ST or listing/delisting metadata.",
+    "No corporate-action event coverage or accounting; adj_factor changes are risk indicators only.",
+    "No official CSI500 benchmark daily series.",
+    "download_market.py merges provider ts_code tables using missing ticker key.",
+    "Importing download/process scripts causes network or filesystem side effects.",
+    "Research factor panel mixes forward labels and drops rows based on future availability.",
+    "Broker, account ledger, backtest and paper engines are not implemented."
+  ],
+  "verification": {
+    "source_ast_parsed": 9,
+    "baseline_command": "python -B -m unittest discover -s tests -p 'test_research_baseline.py' -v",
+    "baseline_tests_run": 8,
+    "baseline_tests_passed": 8,
+    "baseline_exit_code": 0,
+    "pytest_run": false,
+    "provider_permissions_probed": false,
+    "original_file_fingerprints_checked": 35,
+    "original_files_modified_during_p0": [],
+    "coverage_limit": "Research helper baselines and local data audit only; no trading acceptance tests have run."
+  }
+}
