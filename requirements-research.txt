@@ -1,0 +1,6 @@
+# Validated research environment; Python 3.13.11. All were already installed.
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+pyarrow==24.0.0
+matplotlib==3.11.2
