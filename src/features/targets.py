@@ -28,3 +28,19 @@ def market_forward_returns(prices: pd.DataFrame, calendar, horizon: int):
     reason = reason.mask(aligned.isna(), "signal_price_missing")
     reason.loc[end.isna()] = "calendar_boundary"
     return labels, end, reason
+
+
+def attach_labels(frame, panel, horizons):
+    """Join forward labels by the signal date and ticker of each row."""
+    frame = frame.copy()
+    prices = panel.matrix("close_adj")
+    rows = prices.index.get_indexer(frame.trade_date)
+    columns = prices.columns.get_indexer(frame.ticker)
+    if (rows == -1).any() or (columns == -1).any():
+        raise ValueError("input frame index not found in panel")
+    for horizon in horizons:
+        labels, end, reason = market_forward_returns(prices, panel.calendar, horizon)
+        frame[f"future_ret_{horizon}"] = labels.to_numpy()[rows, columns]
+        frame[f"label_end_{horizon}"] = frame.trade_date.map(end)
+        frame[f"label_reason_{horizon}"] = reason.to_numpy()[rows, columns]
+    return frame

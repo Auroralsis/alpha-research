@@ -1,3 +1,5 @@
+"""Price and volume factor formulas and their ranking operators."""
+
 import numpy as np
 import pandas as pd
 

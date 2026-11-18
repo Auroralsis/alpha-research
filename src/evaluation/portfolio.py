@@ -16,7 +16,8 @@ def trading_prices(panel, dates, tickers):
 
 
 def backtest_long_only(open_adj, close_adj, raw_open, up_limit, down_limit,
-                       signals, fee=.0015, rebalance_every=20, offset=0):
+                       signals, fee=.0015, rebalance_every=20, offset=0, *, record_trades=True):
+    """First and third arguments are execution quotes; legacy callers use opens."""
     if fee < 0 or rebalance_every <= 0 or offset < 0:
         raise ValueError("Invalid trading parameters")
     dates, columns = open_adj.index, open_adj.columns
@@ -41,9 +42,8 @@ def backtest_long_only(open_adj, close_adj, raw_open, up_limit, down_limit,
     bought_on = np.full(len(columns), -1)
     records, trades = [], []
     last_signal_date = pd.NaT
-    for row, day in enumerate(dates):
-        op, cl, ro = (matrix.iloc[row].to_numpy(float) for matrix in [open_adj, close_adj, raw_open])
-        up, down = up_limit.iloc[row].to_numpy(float), down_limit.iloc[row].to_numpy(float)
+    quotes = [matrix.to_numpy(dtype=float) for matrix in (open_adj, close_adj, raw_open, up_limit, down_limit)]
+    for row, (day, op, cl, ro, up, down) in enumerate(zip(dates, *quotes)):
         finite_open = np.isfinite(op) & (op > 0)
         at_open = np.where(finite_open, op, marks)
         if ((units > 0) & ~np.isfinite(at_open)).any():
@@ -99,11 +99,12 @@ def backtest_long_only(open_adj, close_adj, raw_open, up_limit, down_limit,
             n_stale=int(stale.sum()), n_holdings=int((units > 0).sum()), rebalance=rebalance,
             n_blocked_buys=blocked_buys, n_blocked_sells=blocked_sells, n_target_without_open=target_without_open,
             pending_exit_value=float(np.dot(units[pending_exits], np.nan_to_num(marks[pending_exits])))))
-        for col in np.flatnonzero((buy_units > 0) | (sell_units > 0)):
-            trades.append(dict(trade_date=day, ticker=columns[col], buy_notional=buy_value[col],
-                               sell_notional=sell_value[col], fee=(buy_value[col]+sell_value[col])*fee,
-                               signal_date=last_signal_date, execution_price=op[col],
-                               bought_units=buy_units[col], sold_units=sell_units[col]))
+        if record_trades:
+            for col in np.flatnonzero((buy_units > 0) | (sell_units > 0)):
+                trades.append(dict(trade_date=day, ticker=columns[col], buy_notional=buy_value[col],
+                                   sell_notional=sell_value[col], fee=(buy_value[col]+sell_value[col])*fee,
+                                   signal_date=last_signal_date, execution_price=op[col],
+                                   bought_units=buy_units[col], sold_units=sell_units[col]))
         previous_equity = equity
     holdings = pd.DataFrame({"ticker": columns, "adjusted_units": units, "last_mark": marks})
     return pd.DataFrame(records), pd.DataFrame(trades), holdings[holdings.adjusted_units > 0]

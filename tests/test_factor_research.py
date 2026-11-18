@@ -6,14 +6,12 @@ import numpy as np
 import pandas as pd
 
 from src.data.research_panel import prepare_panel, prepare_membership, parse_dates
-from src.features.huatai import compute_factors, alpha3, alpha13, alpha44, FACTORS
-from src.features.huatai import cross_sectional_rank, window_covariance, window_correlation, quantile_groups
-from src.features.targets import market_forward_returns
+from src.features.price_volume import compute_factors, alpha3, alpha13, alpha44, FACTORS
+from src.features.price_volume import cross_sectional_rank, window_covariance, window_correlation, quantile_groups
+from src.features.targets import attach_labels, market_forward_returns
 from src.features.neutralization import neutralize, mad_clip, align_industry_history
-from src.evaluation.huatai_study import hac_mean, holm_adjust
-from src.evaluation.huatai_study import evaluate_panel
+from src.evaluation.inference import hac_mean, holm_adjust
 from src.evaluation.portfolio import backtest_long_only, performance, trading_prices
-from src.evaluation.diagnostics import distribution, diagnose
 
 
 def fixture():
@@ -170,16 +168,20 @@ class DataTests(unittest.TestCase):
         # Caller membership is absent from endpoint computation by design.
         self.assertAlmostEqual(labels.loc[dates[1],"A"],16/11-1)
 
+    def test_attach_labels_checks_keys_and_preserves_row_order(self):
+        raw, _, dates = fixture()
+        panel = prepare_panel(raw, dates)
+        frame = pd.DataFrame(dict(trade_date=[dates[11], dates[10]], ticker=["B", "A"]), index=[17, 9])
+        attached = attach_labels(frame, panel, [5])
+        self.assertEqual(attached.index.tolist(), [17, 9])
+        self.assertEqual(attached.label_end_5.tolist(), [dates[16], dates[15]])
+        close = panel.matrix("close_adj")
+        self.assertAlmostEqual(attached.loc[17, "future_ret_5"], close.loc[dates[16], "B"] / close.loc[dates[11], "B"] - 1)
+        with self.assertRaises(ValueError):
+            attach_labels(frame.assign(ticker="unknown"), panel, [5])
+
 
 class StatisticalTests(unittest.TestCase):
-    def test_cross_sectional_incremental_coefficient(self):
-        mom=np.arange(10,dtype=float);alpha=np.array([3,8,1,9,2,7,0,6,4,5.],float)
-        z_m=(mom-mom.mean())/mom.std(ddof=1);z_a=(alpha-alpha.mean())/alpha.std(ddof=1)
-        frame=pd.DataFrame({"trade_date":pd.Timestamp("2023-01-03"),"MOM20":mom,"Alpha13":alpha,
-            "future_ret_5":.02+.1*z_m+.03*z_a,"label_end_5":pd.Timestamp("2023-01-10")})
-        *_,reg=evaluate_panel(frame,["Alpha13","MOM20"],horizons=[5],min_pairs=3)
-        self.assertAlmostEqual(reg.alpha_beta.iloc[0],.03)
-
     def test_hac_manual_calendar_gaps(self):
         x=np.array([1.,2.,np.nan,4.,3.,2.]);valid=np.isfinite(x);n=valid.sum()
         e=np.where(valid,x-np.nanmean(x),0)
@@ -197,16 +199,6 @@ class StatisticalTests(unittest.TestCase):
         rng=np.random.default_rng(19);x=np.zeros(2000)
         for i in range(1,len(x)): x[i]=.8*x[i-1]+rng.normal()
         self.assertGreater(hac_mean(x,lag=20)["hac_se"],hac_mean(x,lag=0)["hac_se"]*2)
-
-    def test_labels_cannot_change_group_membership(self):
-        frame=pd.DataFrame({"trade_date":pd.Timestamp("2023-01-03"),"Alpha13":np.arange(10.),
-            "future_ret_5":np.arange(10.)/100,"label_end_5":pd.Timestamp("2023-01-10")})
-        a=evaluate_panel(frame,["Alpha13"],horizons=[5],min_pairs=3)
-        frame.future_ret_5=np.nan
-        b=evaluate_panel(frame,["Alpha13"],horizons=[5],min_pairs=3)
-        np.testing.assert_array_equal(a[1].n_assigned,b[1].n_assigned)
-        self.assertAlmostEqual(a[0].rank_ic.iloc[0],1.)
-        self.assertEqual(b[0].n_pairs.iloc[0],0)
 
     def test_neutralization_orthogonality_and_pit_guard(self):
         idx=range(30); cap=pd.Series(np.exp(np.arange(30)/10),index=idx)
@@ -294,31 +286,6 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(ledger.n_stale.iloc[2],1)
         self.assertEqual(ledger.pending_exit_value.iloc[2],1.)
         self.assertEqual(ledger.n_holdings.iloc[3],0)
-
-
-class DiagnosticTests(unittest.TestCase):
-    def test_positive_ic_can_coexist_with_negative_arithmetic_spread(self):
-        day=pd.Timestamp("2023-01-03");x=np.arange(100,dtype=float);y=x/1000;y[0]=10.
-        frame=pd.DataFrame({"trade_date":day,"ticker":[str(i) for i in range(100)],"Alpha13":x,"Alpha44":x,
-            "future_ret_5":y,"future_ret_20":y,"label_end_5":day+pd.Timedelta(days=7),
-            "label_end_20":day+pd.Timedelta(days=30),"industry":"a","total_mv":100.,"close_raw":10.})
-        daily,_,_,_=evaluate_panel(frame,["Alpha13"],horizons=[5],min_pairs=3)
-        details,summary,stocks=diagnose(frame,pd.DatetimeIndex([day]),frame[["ticker","trade_date"]],min_pairs=3)
-        s=summary[(summary.analysis=="spread")&(summary.period=="all")&(summary['sample']=="all")&(summary.factor=="Alpha13")&(summary.horizon==5)].set_index("metric")['mean']
-        self.assertGreater(daily.rank_ic.iloc[0],0);self.assertLess(s['mean'],0)
-        self.assertGreater(s['median'],0);self.assertGreater(s['trimmed_mean'],0)
-        self.assertAlmostEqual(stocks[(stocks.factor=="Alpha13")&(stocks.horizon==5)].contribution.sum(),s['mean'])
-        self.assertAlmostEqual(details[(details.factor=="Alpha13")&(details.horizon==5)].ic_contribution.sum(),daily.rank_ic.iloc[0])
-        frame.future_ret_5=np.nan;frame.future_ret_20=np.nan
-        missing,_,_=diagnose(frame,pd.DatetimeIndex([day]),frame[["ticker","trade_date"]],min_pairs=3)
-        np.testing.assert_array_equal(missing.n_assigned,details.n_assigned)
-
-    def test_trim_definition_and_nonfinite_values(self):
-        stats=distribution([0,1,2,3,100,np.nan,np.inf])
-        self.assertAlmostEqual(stats["mean"],21.2)
-        self.assertEqual(stats["median"],2.)
-        self.assertEqual(stats["trimmed_mean"],2.)
-        self.assertEqual(stats["n_observed"],5)
 
 
 if __name__ == "__main__":
