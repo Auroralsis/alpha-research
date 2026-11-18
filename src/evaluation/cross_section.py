@@ -1,5 +1,7 @@
 """Daily weighted factor regressions, rank evidence and across-date summaries."""
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 
@@ -7,8 +9,14 @@ from src.evaluation.factor_metrics import calc_ic_rank
 from src.evaluation.inference import hac_mean, holm_adjust
 
 
-def weighted_slope(design, returns, weights):
-    """Estimate the first coefficient and its conventional within-day WLS SE."""
+def weighted_slope(
+    design: np.ndarray, returns: np.ndarray, weights: np.ndarray,
+) -> tuple[float, float]:
+    """design 是 [股票 × 解释变量] 矩阵，第 0 列是目标因子。
+
+    returns、weights 都是 [股票] 向量，顺序必须与 design 的行一致；
+    weights 是正的回归权重。返回第 0 列的系数和当日 WLS 标准误。
+    """
     if len(returns) <= design.shape[1]:
         return np.nan, np.nan
     scale = np.sqrt(weights / weights.mean())
@@ -23,7 +31,15 @@ def weighted_slope(design, returns, weights):
     return coefficients[0], np.sqrt(variance * covariance[0])
 
 
-def daily_factor_tests(frame, factors, horizons, min_pairs=100):
+def daily_factor_tests(
+    frame: pd.DataFrame, factors: Sequence[str], horizons: Sequence[int], min_pairs: int = 100,
+) -> pd.DataFrame:
+    """输入股票日长表，每行一个（trade_date, ticker）。
+
+    必需列包括 trade_date、next_session_observed、industry、total_mv、circ_mv，
+    每个因子的 _standardized / _neutral 分数列，以及各期限的 future_ret_{h}。
+    返回每行一个（信号日, 因子, 处理方式, 期限）的 Rank IC 和 WLS 结果。
+    """
     rows = []
     for day, group in frame.groupby("trade_date", sort=True):
         research = group.loc[group.next_session_observed]
@@ -51,7 +67,8 @@ def daily_factor_tests(frame, factors, horizons, min_pairs=100):
     return pd.DataFrame(rows)
 
 
-def summarize_factor_tests(daily, dates):
+def summarize_factor_tests(daily: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """输入逐日检验长表和完整交易日历；返回每个（因子, 处理方式, 期限）的汇总。"""
     rows = []
     for (factor, treatment, horizon), group in daily.groupby(["factor", "treatment", "horizon"]):
         group = group.set_index("trade_date").reindex(dates)

@@ -12,10 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.data.research_panel import parse_dates, prepare_membership, prepare_panel
+from src.data.research_panel import ResearchPanel, parse_dates, prepare_membership, prepare_panel
 from src.evaluation.cross_section import daily_factor_tests, summarize_factor_tests
 from src.evaluation.layer_backtest import run_layer_tracks, simulate_track, summarize_tracks, track_metrics
-from src.evaluation.portfolio import trading_prices
+from src.evaluation.portfolio import QuoteGrid, trading_prices
 from src.features.price_volume import compute_factors, quantile_groups
 from src.features.neutralization import align_industry_history, mad_clip, neutralize, standardize
 from src.features.targets import attach_labels
@@ -32,7 +32,8 @@ INPUTS = dict(prices=ROOT / "data/processed/daily/csi500_processed_daily.parquet
 SOURCE = "https://crm.htsc.com.cn/doc/2019/10750101/dae9cd9e-c2cd-4f05-bb6c-e5ac8d216d3d.pdf"
 
 
-def prepare_study(design):
+def prepare_study(design: dict) -> tuple[pd.DataFrame, ResearchPanel, pd.DatetimeIndex]:
+    """读取 design.json 的日期、因子及期限设置，返回（股票日长表、行情容器、信号日索引）。"""
     calendar = pd.DatetimeIndex(parse_dates(pd.read_parquet(INPUTS["calendar"]).cal_date)).sort_values()
     working = calendar[(calendar >= design["warmup_start"]) & (calendar <= design["end"])]
     dates = working[working >= design["signal_start"]]
@@ -56,7 +57,13 @@ def prepare_study(design):
     return frame, panel, dates
 
 
-def market_inputs(frame, panel, dates):
+def market_inputs(
+    frame: pd.DataFrame, panel: ResearchPanel, dates: pd.DatetimeIndex,
+) -> tuple[QuoteGrid, QuoteGrid, pd.Series]:
+    """按 frame.ticker 和 dates 对齐行情；返回开盘行情组、收盘行情组和指数点位。
+
+    每组五张宽表：[交易日 × 股票] 的复权成交价、复权收盘价、原始成交价及两种限价。
+    """
     tickers = pd.Index(sorted(frame.ticker.unique()), name="ticker")
     limits = pd.read_parquet(INPUTS["limits"]).rename(columns={"ts_code": "ticker"})
     limits["trade_date"] = parse_dates(limits.trade_date).to_numpy()
@@ -69,7 +76,10 @@ def market_inputs(frame, panel, dates):
     return (*loose, *bounds), (adjusted, adjusted, raw, *bounds), benchmark
 
 
-def compare_execution(frame, open_quotes, close_quotes, benchmark, design):
+def compare_execution(
+    frame: pd.DataFrame, open_quotes: QuoteGrid, close_quotes: QuoteGrid, benchmark: pd.Series, design: dict,
+) -> pd.DataFrame:
+    """frame 含 trade_date、ticker、Alpha13、Alpha13_neutral；返回逐口径逐偏移的绩效表。"""
     holding, fee = design["main_holding_days"], design["main_fee_bps"]
     rows = []
     for score, quote_sets in [("Alpha13", {"open": open_quotes, "close": close_quotes}),
@@ -83,18 +93,30 @@ def compare_execution(frame, open_quotes, close_quotes, benchmark, design):
     return pd.DataFrame(rows)
 
 
-def markdown_table(frame):
+def markdown_table(frame: pd.DataFrame) -> str:
+    """把表格列名作为表头，每个 DataFrame 行输出一行 Markdown。"""
     header = "| " + " | ".join(frame.columns) + " |"
     separator = "| " + " | ".join(["---"] * len(frame.columns)) + " |"
     body = ["| " + " | ".join(str(value) for value in row) + " |" for row in frame.itertuples(index=False, name=None)]
     return "\n".join([header, separator, *body])
 
 
-def percent(values):
+def percent(values: pd.Series) -> pd.Series:
+    """格式化一列小数，例如 0.15 → '15.00%'；保留索引。"""
     return values.map(lambda value: f"{value:.2%}" if pd.notna(value) else "—")
 
 
-def write_report(summary, aggregate, tracks, nav, benchmark, dates, ranges, frame, daily, design):
+def write_report(
+    summary: pd.DataFrame, aggregate: pd.DataFrame, tracks: pd.DataFrame, nav: pd.DataFrame,
+    benchmark: pd.Series, dates: pd.DatetimeIndex, ranges: dict[int, pd.DatetimeIndex],
+    frame: pd.DataFrame, daily: pd.DataFrame, design: dict,
+) -> None:
+    """用已计算的结果生成报告。
+
+    summary/daily 是汇总/逐日因子检验表；aggregate/tracks 是汇总/逐轨道回测表；
+    nav 是逐轨道逐日净值表。benchmark 按交易日索引；ranges 将各预测期限映射到有效信号日。
+    frame 是含 trade_date、next_session_observed 的股票日长表；design 对应 design.json。
+    """
     artifacts = Path(os.path.relpath(OUT, REPORT.parent)).as_posix()
     base_fee, main_horizon, layer_count = (design[key] for key in ("main_fee_bps", "main_holding_days", "layers"))
     columns = {"factor": "因子", "treatment": "处理", "horizon": "预测日数", "mean_abs_t": "平均|t|",
@@ -183,7 +205,8 @@ def write_report(summary, aggregate, tracks, nav, benchmark, dates, ranges, fram
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def plot_results(aggregate, nav, benchmark, design):
+def plot_results(aggregate: pd.DataFrame, nav: pd.DataFrame, benchmark: pd.Series, design: dict) -> None:
+    """用分层回测汇总、逐轨道日净值和基准点位画年化收益与净值图。"""
     main_horizon, fee = design["main_holding_days"], design["main_fee_bps"]
     layers = aggregate.query('kind == "layer" and holding_days == @main_horizon and fee_bps == @fee')
     fig, axis = plt.subplots(figsize=(8, 4))
@@ -211,7 +234,10 @@ def plot_results(aggregate, nav, benchmark, design):
     plt.close(fig)
 
 
-def plot_rebalance_offsets(tracks, benchmark, dates, design):
+def plot_rebalance_offsets(
+    tracks: pd.DataFrame, benchmark: pd.Series, dates: pd.DatetimeIndex, design: dict,
+) -> None:
+    """tracks 每行是一条回测轨道；用其中的 offset 和 annual_return 画起始日对照。"""
     factors = sorted(design["factors"])
     holding, fee = design["main_holding_days"], design["main_fee_bps"]
     top = tracks.query('kind == "layer" and number == 1 and holding_days == @holding and fee_bps == @fee')
@@ -235,7 +261,7 @@ def plot_rebalance_offsets(tracks, benchmark, dates, design):
     plt.close(fig)
 
 
-def main():
+def main() -> None:
     design_file = OUT / "design.json"
     design = json.loads(design_file.read_text())
     print("Preparing factor and market data", flush=True)

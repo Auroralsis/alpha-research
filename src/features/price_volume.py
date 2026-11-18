@@ -2,12 +2,15 @@
 
 import numpy as np
 import pandas as pd
-
-from .momentum import calc_momentum
+from numpy.typing import ArrayLike
 from scipy.stats import rankdata
 
-def cross_sectional_rank(values):
-    """横截面排名，输入是[trade_date][ticker]的矩阵"""
+from src.data.research_panel import DateValues, ResearchPanel
+from .momentum import calc_momentum
+
+
+def cross_sectional_rank(values: ArrayLike) -> np.ndarray:
+    """输入 [股票] 向量或 [交易日 × 股票] 矩阵，每个日期内部排名；返回同形状数组。"""
     values = np.asarray(values, dtype=float)
     values = np.where(np.isfinite(values), values, np.nan)
     n = np.isfinite(values).sum(axis=-1, keepdims=True)
@@ -17,8 +20,8 @@ def cross_sectional_rank(values):
     return np.where(n >= 2, result, np.nan)
 
 
-def window_covariance(x, y):
-    """计算协方差，输入x和y都是[trade_date][ticker]的矩阵，与上面函数一致"""
+def window_covariance(x: ArrayLike, y: ArrayLike) -> np.ndarray:
+    """x、y 都是 [窗口交易日 × 股票] 矩阵，行列须逐格对应；返回 [股票] 协方差向量。"""
     x, y = np.asarray(x, float), np.asarray(y, float)
     if x.shape != y.shape or x.ndim != 2 or len(x) < 2:
         raise ValueError("Expected matching windows with at least two rows")
@@ -27,8 +30,8 @@ def window_covariance(x, y):
     return np.where(complete, (xc * yc).sum(axis=0) / (len(x) - 1), np.nan)
 
 
-def window_correlation(x, y):
-    """计算相关系数，输入与上面的函数一致"""
+def window_correlation(x: ArrayLike, y: ArrayLike) -> np.ndarray:
+    """x、y 都是 [窗口交易日 × 股票] 矩阵，沿日期计算；返回 [股票] 相关系数向量。"""
     x, y = np.asarray(x, float), np.asarray(y, float)
     covariance = window_covariance(x, y)
     xc, yc = x - x.mean(axis=0), y - y.mean(axis=0)
@@ -41,7 +44,8 @@ def window_correlation(x, y):
     return np.clip(out, -1, 1)
 
 
-def quantile_groups(values, n_groups=5):
+def quantile_groups(values: ArrayLike, n_groups: int = 5) -> np.ndarray:
+    """输入 [股票] 分数或 [交易日 × 股票] 分数矩阵；返回同形状组号（低分为 1）。"""
     ranks = cross_sectional_rank(values)
     return np.ceil(ranks * n_groups).clip(1, n_groups)
 
@@ -49,38 +53,45 @@ def quantile_groups(values, n_groups=5):
 FACTORS = ("Alpha3", "Alpha13", "Alpha44", "MOM20")
 
 
-def _pair_ranks(price, volume):
-    """计算两个量的排名结果"""
+def _pair_ranks(price: np.ndarray, volume: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """两个输入都是同形状的 [交易日 × 股票] 矩阵；返回价格排名和成交量排名矩阵。"""
     # 只有当price和volume两个量均不是NaN时才会参与计算横截面
     valid = np.isfinite(price) & np.isfinite(volume)
     return (cross_sectional_rank(np.where(valid, price, np.nan)),
             cross_sectional_rank(np.where(valid, volume, np.nan)))
 
 
-def alpha3(open_rank, volume_rank):
-    """输入行数为10的开盘价和成交量的归一化排名，这里的输入数据结构依然为[trade_date][ticker]"""
+def alpha3(open_rank: ArrayLike, volume_rank: ArrayLike) -> np.ndarray:
+    """输入 [10 个交易日 × 股票] 的开盘价排名和成交量排名；返回 [股票] 分数。"""
     if len(open_rank) != 10:
         raise ValueError("Alpha3 requires ten market days")
     return -window_correlation(open_rank, volume_rank)
 
 
-def alpha13(close_rank, volume_rank):
+def alpha13(close_rank: ArrayLike, volume_rank: ArrayLike) -> np.ndarray:
+    """输入 [5 个交易日 × 股票] 的收盘价排名和成交量排名；返回 [股票] 分数。"""
     if len(close_rank) != 5:
         raise ValueError("Alpha13 requires five market days")
     return -cross_sectional_rank(window_covariance(close_rank, volume_rank))
 
 
-def alpha44(high, volume_rank):
+def alpha44(high: ArrayLike, volume_rank: ArrayLike) -> np.ndarray:
+    """输入 [5 个交易日 × 股票] 的最高价原值和成交量排名；返回 [股票] 分数。"""
     if len(high) != 5:
         raise ValueError("Alpha44 requires five market days")
     return -window_correlation(high, volume_rank)
 
 
-def compute_factors(panel, membership, signal_dates, price_mode="raw", rank_policy="current_cohort"):
-    """Compute from intact market-grid prices, then emit the date's members.
+def compute_factors(
+    panel: ResearchPanel, membership: pd.DataFrame, signal_dates: DateValues,
+    price_mode: str = "raw", rank_policy: str = "current_cohort",
+) -> pd.DataFrame:
+    """为每个信号日的成员计算分数，返回每行一个（trade_date, ticker）的长表。
 
-    current_cohort reranks each historical row against M_t, not the full-history
-    union. historical_members ranks against M_u and preserves absent ranks.
+    panel 提供含历史窗口的行情；membership 至少有 trade_date、ticker 两列。
+    signal_dates 是研究日期序列，不含前置缓冲日期。
+    price_mode 可选 raw 或 adjusted。current_cohort 用信号日名单给历史窗口排名；
+    historical_members 用窗口内各历史日自己的成员名单。
     """
     if price_mode not in ("raw", "adjusted") or rank_policy not in ("current_cohort", "historical_members"):
         raise ValueError("Unknown factor specification")

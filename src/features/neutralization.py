@@ -1,8 +1,15 @@
+from collections.abc import Sequence
+from datetime import date
+
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
+
+from src.data.research_panel import DateValues
 
 
-def mad_clip(values, multiple=5):
+def mad_clip(values: ArrayLike, multiple: float = 5) -> pd.Series:
+    """输入一维截面数值，按中位数 ± multiple × MAD 截断，保留原行索引。"""
     values = pd.Series(values, copy=True, dtype=float)
     median = values.median()
     mad = (values - median).abs().median()
@@ -10,17 +17,23 @@ def mad_clip(values, multiple=5):
     return values if not np.isfinite(mad) or mad == 0 else values.clip(median - multiple * mad, median + multiple * mad)
 
 
-def standardize(values):
+def standardize(values: ArrayLike) -> pd.Series:
+    """输入一维截面数值（每项一只股票）；返回同索引的标准分数。"""
     values = pd.Series(values, dtype=float)
     sd = values.std(ddof=1)
     return (values - values.mean()) / sd if np.isfinite(sd) and sd > 1e-12 else values * np.nan
 
 
-def neutralize(factor, total_mv, industry, known_at=None, signal_date=None):
-    """MAD clip -> OLS residual on industry and log total cap -> z score.
+def neutralize(
+    factor: ArrayLike, total_mv: ArrayLike, industry: pd.Series | Sequence[str],
+    known_at: DateValues | None = None, signal_date: date | str | None = None,
+) -> pd.Series:
+    """输入同一天的三列 [股票] 数据：因子分数、总市值、行业代码。
 
-    An explicit known_at check is available for event tables. An in_date alone
-    certifies effective history, not publication-time PIT; callers must disclose.
+    用 Series 时三列按索引对齐。先去极值，再对行业和对数总市值回归，
+    返回标准化残差；缺少控制变量的股票保留缺失。
+    可选 known_at 是控制变量的可知日期；提供时须给 signal_date（信号日），
+    仅有行业生效日不能替代公告可知日期。
     """
     frame = pd.concat([pd.Series(factor).rename("factor"), pd.Series(total_mv).rename("cap"),
                        pd.Series(industry).rename("industry")], axis=1)
@@ -43,10 +56,11 @@ def neutralize(factor, total_mv, industry, known_at=None, signal_date=None):
     return result
 
 
-def align_industry_history(keys, history):
-    """Use effective [in_date,out_date) intervals; ambiguous overlaps stay missing.
+def align_industry_history(keys: pd.DataFrame, history: pd.DataFrame) -> pd.Series:
+    """给 keys 的每条（ticker, trade_date）匹配当日行业。
 
-    Returns industry only; does not invent an announcement known_at timestamp.
+    history 至少含 ts_code、in_date、out_date、l1_code，按 [in_date, out_date) 生效。
+    返回与 keys 同索引的行业代码列；没有匹配或多个行业互相冲突时保留缺失。
     """
     output = pd.Series(pd.NA, index=keys.index, dtype="string")
     history = history.copy()

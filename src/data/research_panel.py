@@ -1,9 +1,15 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 
 import numpy as np
 import pandas as pd
 
-def parse_dates(values):
+DateValues = pd.Series | pd.Index | np.ndarray | Sequence[date | str | int]
+
+
+def parse_dates(values: DateValues) -> pd.Series:
+    """输入一维日期，如 `["20230103", "20230104"]`；返回重新编号的日期列。"""
     # 丢弃输入的旧标签并重新编号，不保存旧标签结果作为新列
     values = pd.Series(values).reset_index(drop=True)
     # 如果输入是日期类型直接转换，否则先转string再处理
@@ -24,11 +30,17 @@ def parse_dates(values):
 
 @dataclass
 class ResearchPanel:
+    """`daily` 是股票日行情长表，`calendar` 和 `tickers` 定义宽表的行列。"""
+
     daily: pd.DataFrame
     calendar: pd.DatetimeIndex
     tickers: pd.Index
 
-    def matrix(self, column, clean=True):
+    def matrix(self, column: str, clean: bool = True) -> pd.DataFrame:
+        """取 `daily` 的一个字段，例如 `close_adj`，返回 [交易日 × 股票] 宽表。
+
+        行索引是交易日，列名是股票代码。clean=True 时屏蔽非 observed 行情。
+        """
         data = self.daily
         values = data[column]
         if clean:
@@ -40,14 +52,19 @@ class ResearchPanel:
         return (data[["ticker", "trade_date"]].assign(value=values).pivot(index="trade_date", columns="ticker", values="value")
                 .reindex(index=self.calendar, columns=self.tickers))
 
-    def observation_status(self):
+    def observation_status(self) -> pd.DataFrame:
+        """返回 [交易日 × 股票] 状态矩阵；没有记录的格子为 no_record_unknown。"""
         # 这里返回observation_status，fillna时填充"no_record_unknown"
         return (self.daily.pivot(index="trade_date", columns="ticker", values="observation_status")
                 .reindex(index=self.calendar, columns=self.tickers).fillna("no_record_unknown"))
-    
 
-def prepare_panel(daily : pd.DataFrame, calendar):
-    """在按照日历时间范围裁剪数据之前，先确定锚定基准，并保留进入时间窗口之前和退出时间窗口之后的历史数据。"""
+
+def prepare_panel(daily: pd.DataFrame, calendar: DateValues) -> ResearchPanel:
+    """整理行情长表：每行是一只股票在一天的记录。
+
+    daily 必需列：ticker、trade_date、open、high、low、close、vol、amount、adj_factor。
+    calendar 是研究用的一维市场交易日历。先用完整行情定复权锚点，再按日历裁剪。
+    """
     dates = pd.DatetimeIndex(parse_dates(calendar)).sort_values()
     # 确保交易日历不重复，非空
     if dates.has_duplicates or len(dates) == 0:
@@ -91,8 +108,11 @@ def prepare_panel(daily : pd.DataFrame, calendar):
     return ResearchPanel(data, dates, pd.Index(sorted(daily.ticker.unique()), name="ticker"))
 
 
-def prepare_membership(membership):
-    """处理历史股票名单"""
+def prepare_membership(membership: pd.DataFrame) -> pd.DataFrame:
+    """整理成员长表，每行是某日的一个股票池成员。
+
+    必需列：trade_date（信号日）、ticker（股票代码）、source_snapshot_date（快照日）。
+    """
     data = membership.copy()
     for column in ["trade_date", "source_snapshot_date"]:
         data[column] = parse_dates(data[column]).to_numpy()

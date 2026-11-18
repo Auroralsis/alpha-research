@@ -1,8 +1,11 @@
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.stats import norm
 
 
-def hac_mean(values, lag=20, min_obs=100, min_coverage=.8):
+def hac_mean(
+    values: ArrayLike, lag: int = 20, min_obs: int = 100, min_coverage: float = .8,
+) -> dict[str, float | int | str]:
     """计算时间序列均值及其 HAC 稳健统计检验结果。
 
     输入参数：
@@ -44,8 +47,8 @@ def hac_mean(values, lag=20, min_obs=100, min_coverage=.8):
     return result
 
 
-def holm_adjust(p_values):
-    """对同一检验族的 p 值做 Holm 校正。"""
+def holm_adjust(p_values: ArrayLike) -> np.ndarray:
+    """输入长度为检验项数的 p 值向量；返回按原顺序排列的校正值。"""
     p = np.asarray(p_values, float)
     if ((p[np.isfinite(p)] < 0) | (p[np.isfinite(p)] > 1)).any():
         raise ValueError("Invalid p value")

@@ -7,17 +7,34 @@ limit prices block orders at the opening limit; missing quotes never fill.
 import numpy as np
 import pandas as pd
 
+from src.data.research_panel import ResearchPanel
 
-def trading_prices(panel, dates, tickers):
-    """Opening decisions must not depend on the execution day's closing fields."""
+
+TradeSignals = dict[pd.Timestamp, list[str]]
+QuoteGrid = tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
+
+
+def trading_prices(panel: ResearchPanel, dates: pd.DatetimeIndex, tickers: pd.Index) -> list[pd.DataFrame]:
+    """返回复权开盘价、复权收盘价、原始开盘价，均按 dates 为行、tickers 为列对齐。"""
     return [panel.matrix(column, clean=False).reindex(index=dates, columns=tickers)
             .where(lambda x: np.isfinite(x) & x.gt(0))
             for column in ["open_adj", "close_adj", "open"]]
 
 
-def backtest_long_only(open_adj, close_adj, raw_open, up_limit, down_limit,
-                       signals, fee=.0015, rebalance_every=20, offset=0, *, record_trades=True):
-    """First and third arguments are execution quotes; legacy callers use opens."""
+def backtest_long_only(
+    open_adj: pd.DataFrame, close_adj: pd.DataFrame, raw_open: pd.DataFrame,
+    up_limit: pd.DataFrame, down_limit: pd.DataFrame, signals: TradeSignals,
+    fee: float = .0015, rebalance_every: int = 20, offset: int = 0, *,
+    record_trades: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """模拟一条多头组合轨道，返回（每日账本、逐笔成交、期末持仓）。
+
+    五张行情表都是同一 [交易日 × 股票] 网格。open_adj、raw_open 保留旧参数名，
+    分别表示复权和原始成交价；次日收盘口径传入收盘价。close_adj 是收盘估值价，
+    up_limit、down_limit 是原始价格口径的涨跌停价。
+    signals 如 {pd.Timestamp("2025-01-06"): ["000001.SZ"]}，键是信号日。
+    fee 是每边小数费率；rebalance_every 和 offset 都以市场交易日为单位。
+    """
     if fee < 0 or rebalance_every <= 0 or offset < 0:
         raise ValueError("Invalid trading parameters")
     dates, columns = open_adj.index, open_adj.columns
@@ -110,7 +127,11 @@ def backtest_long_only(open_adj, close_adj, raw_open, up_limit, down_limit,
     return pd.DataFrame(records), pd.DataFrame(trades), holdings[holdings.adjusted_units > 0]
 
 
-def performance(ledger, benchmark=None):
+def performance(ledger: pd.DataFrame, benchmark: pd.Series | None = None) -> dict[str, float]:
+    """每日账本需含 trade_date、nav、daily_return、turnover_two_sided、cost、stale_value。
+
+    benchmark 是以交易日为索引的基准收盘点位列，不是日收益列。
+    """
     returns = ledger.daily_return
     total = ledger.nav.iloc[-1]
     sd = returns.std(ddof=1)

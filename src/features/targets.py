@@ -1,13 +1,22 @@
+from collections.abc import Iterable
+
 import pandas as pd
 
-def calc_future_return(prices : pd.Series , horizon):
+from src.data.research_panel import DateValues, ResearchPanel
+
+
+def calc_future_return(prices: pd.Series, horizon: int) -> pd.Series:
+    """输入已按日期排序的单只股票价格；horizon 是向后取价的行数。"""
     return prices.shift(-horizon) / prices - 1
 
 
-def market_forward_returns(prices: pd.DataFrame, calendar, horizon: int):
-    """输入复权收盘价(prices)，日期为行，股票为列，交易日历(calender)，未来期限(horizon)
+def market_forward_returns(
+    prices: pd.DataFrame, calendar: DateValues, horizon: int,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    """输入 [交易日 × 股票] 复权收盘价、完整交易日历和未来交易日数。
 
-        返回收益标签矩阵(labels)、收益计算的终点日期(end)，以及终点数据可用性及缺失原因(reason)。
+    返回 labels、end、reason：收益和缺失原因都是 [交易日 × 股票] 宽表，
+    end 是以信号日为索引的一维终点日期列。
     """
     # 要求期限horizon是正整数
     if not isinstance(horizon, int) or horizon <= 0:
@@ -30,8 +39,11 @@ def market_forward_returns(prices: pd.DataFrame, calendar, horizon: int):
     return labels, end, reason
 
 
-def attach_labels(frame, panel, horizons):
-    """Join forward labels by the signal date and ticker of each row."""
+def attach_labels(frame: pd.DataFrame, panel: ResearchPanel, horizons: Iterable[int]) -> pd.DataFrame:
+    """frame 是带 trade_date、ticker 的长表；两列共同定位 panel 的一个价格格子。
+
+    horizons 如 [5, 10, 20]。返回原表副本，为每个期限添加收益、终点日期及缺失原因。
+    """
     frame = frame.copy()
     prices = panel.matrix("close_adj")
     rows = prices.index.get_indexer(frame.trade_date)
