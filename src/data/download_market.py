@@ -16,12 +16,11 @@ market_code = membership_df['ticker'].unique()
 
 start_date = '20150901'
 end_date = '20260228'
-
+# 避免高频访问tushare导致api报错
 request_interval = 0.4
 
 frames = []
 adj_factor_frames = []
-
 for code in tqdm(market_code, desc='下载股票历史数据'):
     daily = pro.daily(
         ts_code=code,

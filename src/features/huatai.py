@@ -1,4 +1,3 @@
-"""Huatai (2019), pp. 5/6/32. No formula direction or window selection."""
 import numpy as np
 import pandas as pd
 
@@ -6,14 +5,18 @@ from .momentum import calc_momentum
 from scipy.stats import rankdata
 
 def cross_sectional_rank(values):
+    """横截面排名，输入是[trade_date][ticker]的矩阵"""
     values = np.asarray(values, dtype=float)
     values = np.where(np.isfinite(values), values, np.nan)
     n = np.isfinite(values).sum(axis=-1, keepdims=True)
+    # 这里计算排名时直接忽略NaN的股票
     result = rankdata(values, method="average", axis=-1, nan_policy="omit") / np.maximum(n, 1)
+    # 只对至少有两个股票的横截面给出排名结果
     return np.where(n >= 2, result, np.nan)
 
 
 def window_covariance(x, y):
+    """计算协方差，输入x和y都是[trade_date][ticker]的矩阵，与上面函数一致"""
     x, y = np.asarray(x, float), np.asarray(y, float)
     if x.shape != y.shape or x.ndim != 2 or len(x) < 2:
         raise ValueError("Expected matching windows with at least two rows")
@@ -23,12 +26,16 @@ def window_covariance(x, y):
 
 
 def window_correlation(x, y):
+    """计算相关系数，输入与上面的函数一致"""
     x, y = np.asarray(x, float), np.asarray(y, float)
     covariance = window_covariance(x, y)
     xc, yc = x - x.mean(axis=0), y - y.mean(axis=0)
     denominator = np.sqrt((xc * xc).sum(axis=0) * (yc * yc).sum(axis=0))
+    # np.full是根据输入shape和填充值填充一个数组
     out = np.full(covariance.shape, np.nan)
+    # 这里为了防止denominator过小(比如某一个股票的某一组数据标准差为0时)而设置阈值
     np.divide(covariance * (len(x) - 1), denominator, out=out, where=denominator > 1e-24)
+    # 将输出限制在[-1,1]之间，超出的结果赋值为-1或1
     return np.clip(out, -1, 1)
 
 
@@ -41,12 +48,15 @@ FACTORS = ("Alpha3", "Alpha13", "Alpha44", "MOM20")
 
 
 def _pair_ranks(price, volume):
+    """计算两个量的排名结果"""
+    # 只有当price和volume两个量均不是NaN时才会参与计算横截面
     valid = np.isfinite(price) & np.isfinite(volume)
     return (cross_sectional_rank(np.where(valid, price, np.nan)),
             cross_sectional_rank(np.where(valid, volume, np.nan)))
 
 
 def alpha3(open_rank, volume_rank):
+    """输入行数为10的开盘价和成交量的归一化排名，这里的输入数据结构依然为[trade_date][ticker]"""
     if len(open_rank) != 10:
         raise ValueError("Alpha3 requires ten market days")
     return -window_correlation(open_rank, volume_rank)
@@ -76,6 +86,7 @@ def compute_factors(panel, membership, signal_dates, price_mode="raw", rank_poli
     arrays = {name: panel.matrix(name + suffix).to_numpy() for name in ["open", "close", "high"]}
     arrays["vol"] = panel.matrix("vol").to_numpy()
     close = panel.matrix("close_adj")
+    # 这里要求
     mom = calc_momentum(close, 20).where(close.rolling(21, min_periods=21).count().eq(21))
     members = {d: g for d, g in membership.groupby("trade_date", sort=True)}
     ticker_pos = {t: i for i, t in enumerate(panel.tickers)}
@@ -107,7 +118,7 @@ def compute_factors(panel, membership, signal_dates, price_mode="raw", rank_poli
                 pairs[field] = tuple(a[row-9:row+1, idx] for a in ranks[field])
         frame["Alpha3"] = alpha3(*pairs["open"])
         frame["Alpha13"] = alpha13(*(a[-5:] for a in pairs["close"]))
-        # HIGH remains a price. Only volume is ranked.
+        # high是直接数值，而不是排名。成交量volume是排名
         frame["Alpha44"] = alpha44(arrays["high"][row-4:row+1, idx], pairs["high"][1][-5:])
         frame["MOM20"] = mom.iloc[row, idx].to_numpy()
         frame["eligible_t"] = True

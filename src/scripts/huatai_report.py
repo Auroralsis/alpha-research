@@ -1,4 +1,3 @@
-"""The study's four figures, two reports, and reproducibility checks."""
 import hashlib
 import importlib.util
 import json

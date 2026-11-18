@@ -3,8 +3,10 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 project_root_dir = Path("/home/lxy/quant/alpha-research")
+# 读取股票池和交易日历全部数据
 universe_raw_data = project_root_dir / "data" / "raw" / "universe" / "csi500_weight_snapshots.parquet"
 calender_raw_data = project_root_dir / "data" / "raw" / "calender" / "trade_calender_2016_2025.parquet"
+# 制作历史股票池数据并写入
 membership_data = project_root_dir / "data" / "processed" / "universe" / "csi500_membership.parquet"
 
 df = pd.read_parquet(universe_raw_data)

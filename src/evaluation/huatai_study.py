@@ -1,4 +1,3 @@
-"""Daily IC, frozen quantiles, and MOM20 conditional prediction evidence."""
 import numpy as np
 import pandas as pd
 
@@ -9,11 +8,15 @@ from src.features.huatai import quantile_groups, cross_sectional_rank
 
 
 def hac_mean(values, lag=20, min_obs=100, min_coverage=.8):
-    """Bartlett HAC sandwich for the observed-mean estimating equation.
+    """计算时间序列均值及其 HAC 稳健统计检验结果。
 
-    Missing calendar slots carry zero score, not a zero observation. Distances
-    remain market-day distances; denominator is the observed count squared.
-    This handles timing, but cannot correct non-random missing outcomes.
+    输入参数：
+        values: 一维数组或序列，通常为按市场交易日升序排列的每日 RankIC。
+            每个元素对应一个市场交易日，缺失观测使用 NaN 表示。
+            输入应已对齐完整市场交易日历，不能直接删除缺失日期。
+        lag: int，HAC 估计考虑的最大滞后交易日数，默认20。
+        min_obs: int，进行统计推断所需的最少有效观测数，默认100。
+        min_coverage: float，最小有效数据覆盖率，默认0.8。
     """
     values = np.asarray(values, float)
     valid = np.isfinite(values)
@@ -25,7 +28,9 @@ def hac_mean(values, lag=20, min_obs=100, min_coverage=.8):
     if n < min_obs or n / max(len(values), 1) < min_coverage or len(values) <= lag:
         return result
     score = np.where(valid, values - mean, 0.)
+    # 初始meat就是偏差平方，用于计算方差
     meat = np.dot(score, score)
+    # 这里加入时间协方差修正，因为这么多个交易日的IC值是有相关性的，不能够直接计算
     for k in range(1, min(lag, len(values) - 1) + 1):
         meat += 2 * (1 - k / (lag + 1)) * np.dot(score[k:], score[:-k])
     variance = meat / n**2 * n / (n - 1)
@@ -73,12 +78,14 @@ def evaluate_panel(frame, factors, horizons=(5, 20), min_pairs=100):
     daily, quantiles, correlations, regressions = [], [], [], []
     for day, group in frame.groupby("trade_date", sort=True):
         for factor in factors:
+            # 这里取出每个特定trade_date对应的一组因子的数据
             x = group[factor]
             # Assignment sees factors only, never labels or label availability.
             q = pd.Series(quantile_groups(x), index=group.index)
             full = q.nunique() == 5
             for h in horizons:
                 y = group[f"future_ret_{h}"]
+                # mask确保只使用有限数值的因子计算，排除NaN和无穷大的数值
                 mask = np.isfinite(x) & np.isfinite(y)
                 n = int(mask.sum())
                 usable = n >= min_pairs and x[mask].nunique() > 1 and y[mask].nunique() > 1
@@ -129,7 +136,10 @@ def evaluate_panel(frame, factors, horizons=(5, 20), min_pairs=100):
 
 def summarize_ic(daily, calendar, lag=20, bootstrap=False):
     rows = []
+    # 根据daily数据的factor和horizon分组。这里daily数据不包括ticker，因为
+    # 每一天的rank_ic是所有股票当天的因子和未来收益率的rank_ic。
     for (factor, h), group in daily.groupby(["factor", "horizon"], sort=True):
+        # 将每一组的交易日期作为索引后，再去reindex(calender)
         series = group.set_index("trade_date").rank_ic.reindex(calendar)
         stats = hac_mean(series.to_numpy(), lag=lag)
         sd = series.std(ddof=1)

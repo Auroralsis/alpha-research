@@ -1,4 +1,3 @@
-"""One offline entry point: python -B -m src.scripts.run_huatai_research."""
 import json
 import logging
 import os
@@ -24,11 +23,21 @@ OUT = ROOT / "results/huatai_alpha"
 
 
 def attach_labels(frame, panel, horizons):
+    """输入的frame是实际研究的股票和日期(这里没用限制是否在membership中)，
+        panel是总的研究数据，包括全部的时间段和股票
+        horizons通常是[5,20]，用于计算未来收益
+    """
     frame = frame.copy()
     prices = panel.matrix("close_adj")
+    # 分别取出frame.trade_date和columns在price中对应的位置索引
+    # 如果get_indexer没找到相应索引，就会返回-1，在np后续访问时会访问最后一个元素
+    # 不过由于这里的frame是panel生成的，所以预期一定能够找到
     row, col = prices.index.get_indexer(frame.trade_date), prices.columns.get_indexer(frame.ticker)
+    if (row == -1).any() or (col == -1).any():
+        raise ValueError("input frame index not found in panel")
     for h in horizons:
         labels, end, reason = market_forward_returns(prices, panel.calendar, h)
+        # 这里得到的结果都是一个一维np数组，[row,col]是一一配对，不是全部交叉组合
         frame[f"future_ret_{h}"] = labels.to_numpy()[row,col]
         frame[f"label_end_{h}"] = frame.trade_date.map(end)
         frame[f"label_reason_{h}"] = reason.to_numpy()[row,col]

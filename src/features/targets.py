@@ -5,14 +5,15 @@ def calc_future_return(prices : pd.Series , horizon):
 
 
 def market_forward_returns(prices: pd.DataFrame, calendar, horizon: int):
-    """Reindex first: shift then counts market days, not observed stock records.
+    """输入复权收盘价(prices)，日期为行，股票为列，交易日历(calender)，未来期限(horizon)
 
-    Return the label matrix, endpoint dates, and endpoint availability reasons.
-    Missing prices are never forward-filled here.
+        返回收益标签矩阵(labels)、收益计算的终点日期(end)，以及终点数据可用性及缺失原因(reason)。
     """
+    # 要求期限horizon是正整数
     if not isinstance(horizon, int) or horizon <= 0:
         raise ValueError("horizon must be a positive integer")
     dates = pd.DatetimeIndex(calendar)
+    # 要求交易日历递增不重复
     if not dates.is_monotonic_increasing or dates.has_duplicates:
         raise ValueError("Calendar must be increasing and unique")
     if prices.index.has_duplicates:

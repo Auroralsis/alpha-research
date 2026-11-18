@@ -1,4 +1,3 @@
-"""Cross-sectional preprocessing; controls must be historically aligned first."""
 import numpy as np
 import pandas as pd
 
