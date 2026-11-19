@@ -1,9 +1,9 @@
-"""Run the documented single-factor replication on frozen CSI 500 inputs."""
+"""运行基于本地中证500数据的单因子研究。"""
 
-import hashlib
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/factor_study_matplotlib")
 import matplotlib
@@ -12,93 +12,76 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.data.research_panel import ResearchPanel, parse_dates, prepare_membership, prepare_panel
+from src.data.research_panel import CSI500_INPUTS as INPUTS
+from src.data.research_panel import ROOT, ResearchPanel, load_market_calendar, prepare_membership, prepare_panel
 from src.evaluation.cross_section import daily_factor_tests, summarize_factor_tests
-from src.evaluation.layer_backtest import run_layer_tracks, simulate_track, summarize_tracks, track_metrics
-from src.evaluation.portfolio import QuoteGrid, trading_prices
-from src.features.price_volume import compute_factors, quantile_groups
-from src.features.neutralization import align_industry_history, mad_clip, neutralize, standardize
+from src.evaluation.layer_backtest import build_targets, run_layer_tracks, summarize_tracks
+from src.evaluation.portfolio import BuyQuotes, QuoteGrid, backtest_long_only, benchmark_nav, close_market_inputs, load_benchmark, performance
+from src.features.price_volume import compute_factors
+from src.features.neutralization import attach_neutral_scores, mad_clip, standardize
 from src.features.targets import attach_labels
+from src.reporting import markdown_table as format_table
+from src.reporting import number_table_captions, sha256
 
-ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "results/factor_study"
-REPORT = ROOT / "docs/factor_study.md"
-AUX = ROOT / "data/reference/csi500"
-INPUTS = dict(prices=ROOT / "data/processed/daily/csi500_processed_daily.parquet",
-              membership=ROOT / "data/processed/universe/csi500_membership.parquet",
-              calendar=ROOT / "data/raw/calender/trade_calender_2016_2025.parquet",
-              caps=AUX / "daily_basic.parquet", industries=AUX / "industry_history.parquet",
-              limits=AUX / "stk_limit.parquet", benchmark=AUX / "benchmark.csv")
+REPORT = ROOT / "docs/ml_study.md"
+FACTOR_HEADING = "## 传统单因子研究"
 SOURCE = "https://crm.htsc.com.cn/doc/2019/10750101/dae9cd9e-c2cd-4f05-bb6c-e5ac8d216d3d.pdf"
 
 
 def prepare_study(design: dict) -> tuple[pd.DataFrame, ResearchPanel, pd.DatetimeIndex]:
     """读取 design.json 的日期、因子及期限设置，返回（股票日长表、行情容器、信号日索引）。"""
-    calendar = pd.DatetimeIndex(parse_dates(pd.read_parquet(INPUTS["calendar"]).cal_date)).sort_values()
+    calendar = load_market_calendar(INPUTS["calendar"])
     working = calendar[(calendar >= design["warmup_start"]) & (calendar <= design["end"])]
     dates = working[working >= design["signal_start"]]
     members = prepare_membership(pd.read_parquet(INPUTS["membership"]))
     panel = prepare_panel(pd.read_parquet(INPUTS["prices"]), working)
     frame = compute_factors(panel, members, dates, design["factor_price"], design["rank_policy"])
     frame = attach_labels(frame, panel, design["horizons"])
-    caps = pd.read_parquet(INPUTS["caps"]).rename(columns={"ts_code": "ticker"})
-    caps["trade_date"] = parse_dates(caps.trade_date).to_numpy()
-    frame = frame.merge(caps, on=["ticker", "trade_date"], how="left", validate="one_to_one")
-    frame["industry"] = align_industry_history(frame, pd.read_parquet(INPUTS["industries"]))
+    frame = attach_neutral_scores(frame, pd.read_parquet(INPUTS["caps"]), pd.read_parquet(INPUTS["industries"]),
+                                  design["factors"])
     observed = panel.observation_status().eq("observed").shift(-1, fill_value=False)
     frame["next_session_observed"] = observed.to_numpy()[observed.index.get_indexer(frame.trade_date),
                                                          observed.columns.get_indexer(frame.ticker)]
     for factor in design["factors"]:
         frame[f"{factor}_standardized"] = frame.groupby("trade_date")[factor].transform(
             lambda values: standardize(mad_clip(values)))
-        frame[f"{factor}_neutral"] = np.nan
-        for _, group in frame.groupby("trade_date"):
-            frame.loc[group.index, f"{factor}_neutral"] = neutralize(group[factor], group.total_mv, group.industry)
     return frame, panel, dates
 
 
 def market_inputs(
     frame: pd.DataFrame, panel: ResearchPanel, dates: pd.DatetimeIndex,
-) -> tuple[QuoteGrid, QuoteGrid, pd.Series]:
-    """按 frame.ticker 和 dates 对齐行情；返回开盘行情组、收盘行情组和指数点位。
+) -> tuple[QuoteGrid, BuyQuotes, pd.Series]:
+    """按 frame.ticker 和 dates 对齐行情，返回收盘行情、VWAP 买入行情和指数点位。
 
-    每组五张宽表：[交易日 × 股票] 的复权成交价、复权收盘价、原始成交价及两种限价。
+    买入行情由复权 VWAP 和原始最低价组成，原始最低价用于判断全天锁涨停。
     """
     tickers = pd.Index(sorted(frame.ticker.unique()), name="ticker")
-    limits = pd.read_parquet(INPUTS["limits"]).rename(columns={"ts_code": "ticker"})
-    limits["trade_date"] = parse_dates(limits.trade_date).to_numpy()
-    bounds = [limits.pivot(index="trade_date", columns="ticker", values=column).reindex(index=dates, columns=tickers)
-              for column in ("up_limit", "down_limit")]
-    loose = trading_prices(panel, dates, tickers)
-    adjusted, raw = [panel.matrix(column).reindex(index=dates, columns=tickers) for column in ("close_adj", "close")]
-    benchmark = pd.read_csv(INPUTS["benchmark"], dtype={"trade_date": str})
-    benchmark = pd.Series(benchmark.close.to_numpy(), index=pd.DatetimeIndex(parse_dates(benchmark.trade_date)))
-    return (*loose, *bounds), (adjusted, adjusted, raw, *bounds), benchmark
+    close_quotes, benchmark = close_market_inputs(panel, dates, tickers, INPUTS["limits"], INPUTS["benchmark"])
+    vwap, low = [panel.matrix(column).reindex(index=dates, columns=tickers) for column in ("vwap_adj", "low")]
+    return close_quotes, (vwap, low), benchmark
 
 
 def compare_execution(
-    frame: pd.DataFrame, open_quotes: QuoteGrid, close_quotes: QuoteGrid, benchmark: pd.Series, design: dict,
+    frame: pd.DataFrame, close_quotes: QuoteGrid, buy_quotes: BuyQuotes, benchmark: pd.Series, design: dict,
 ) -> pd.DataFrame:
-    """frame 含 trade_date、ticker、Alpha13、Alpha13_neutral；返回逐口径逐偏移的绩效表。"""
+    """frame 含 trade_date、ticker、Alpha13、Alpha13_neutral；对最高分层返回逐口径逐偏移的绩效表。"""
     holding, fee = design["main_holding_days"], design["main_fee_bps"]
     rows = []
-    for score, quote_sets in [("Alpha13", {"open": open_quotes, "close": close_quotes}),
-                              ("Alpha13_neutral", {"close": close_quotes})]:
-        signals = {day: group.loc[quantile_groups(group[score]) == 5, "ticker"].tolist()
-                   for day, group in frame.groupby("trade_date")}
+    for score, quote_sets in [("Alpha13", {"close": None, "vwap_buy": buy_quotes}),
+                              ("Alpha13_neutral", {"vwap_buy": buy_quotes})]:
+        layers = build_targets(frame, score, design["layers"])
         for execution, quotes in quote_sets.items():
             for offset in range(holding):
-                ledger = simulate_track(quotes, signals, holding, offset, fee)
-                rows.append(dict(score=score, execution=execution, offset=offset, **track_metrics(ledger, benchmark)))
+                result = backtest_long_only(close_quotes, layers[0], fee_bps=fee, rebalance_every=holding,
+                                            offset=offset, record_trades=False, buy_quotes=quotes)
+                rows.append(dict(score=score, execution=execution, offset=offset, **performance(result.ledger, benchmark)))
     return pd.DataFrame(rows)
 
 
 def markdown_table(frame: pd.DataFrame) -> str:
-    """把表格列名作为表头，每个 DataFrame 行输出一行 Markdown。"""
-    header = "| " + " | ".join(frame.columns) + " |"
-    separator = "| " + " | ".join(["---"] * len(frame.columns)) + " |"
-    body = ["| " + " | ".join(str(value) for value in row) + " |" for row in frame.itertuples(index=False, name=None)]
-    return "\n".join([header, separator, *body])
+    """用 DataFrame 的列名作表头，将每行转换成 Markdown。"""
+    return format_table(frame.columns, frame.itertuples(index=False, name=None))
 
 
 def percent(values: pd.Series) -> pd.Series:
@@ -106,56 +89,49 @@ def percent(values: pd.Series) -> pd.Series:
     return values.map(lambda value: f"{value:.2%}" if pd.notna(value) else "—")
 
 
-def write_report(
+def factor_section(
     summary: pd.DataFrame, aggregate: pd.DataFrame, tracks: pd.DataFrame, nav: pd.DataFrame,
-    benchmark: pd.Series, dates: pd.DatetimeIndex, ranges: dict[int, pd.DatetimeIndex],
-    frame: pd.DataFrame, daily: pd.DataFrame, design: dict,
-) -> None:
-    """用已计算的结果生成报告。
+    benchmark: pd.Series, dates: pd.DatetimeIndex, design: dict, report: Path,
+) -> str:
+    """用已计算的结果生成统一报告中的传统单因子部分。
 
-    summary/daily 是汇总/逐日因子检验表；aggregate/tracks 是汇总/逐轨道回测表；
-    nav 是逐轨道逐日净值表。benchmark 按交易日索引；ranges 将各预测期限映射到有效信号日。
-    frame 是含 trade_date、next_session_observed 的股票日长表；design 对应 design.json。
+    summary 是因子检验汇总表，aggregate/tracks 是汇总和逐轨道回测表。
+    nav 是逐轨道逐日净值表，benchmark 按交易日索引，design 对应 design.json。
     """
-    artifacts = Path(os.path.relpath(OUT, REPORT.parent)).as_posix()
+    artifacts = Path(os.path.relpath(OUT, report.parent)).as_posix()
+    factor_prices = "复权行情" if design["factor_price"] == "adjusted" else "原始行情"
     base_fee, main_horizon, layer_count = (design[key] for key in ("main_fee_bps", "main_holding_days", "layers"))
-    columns = {"factor": "因子", "treatment": "处理", "horizon": "预测日数", "mean_abs_t": "平均|t|",
-               "share_abs_t_gt_2": "|t|>2占比", "mean_t": "平均t", "mean_factor_return": "平均回归斜率",
-               "mean_rank_ic": "平均IC", "rank_ic_std": "IC标准差", "icir": "ICIR", "share_ic_positive": "正IC占比"}
-    regressions = summary[list(columns)].copy()
-    for col in ("share_abs_t_gt_2", "mean_factor_return", "mean_rank_ic", "rank_ic_std", "share_ic_positive"):
-        regressions[col] = percent(regressions[col])
-    for col in ("mean_abs_t", "mean_t", "icir"):
-        regressions[col] = regressions[col].map(lambda value: f"{value:.3f}")
-    regressions = regressions.rename(columns=columns)
-    regressions.columns = regressions.columns.str.replace("|", "&#124;", regex=False)
-    selected = aggregate[(aggregate.kind.eq("layer") & aggregate.number.eq(1)) | aggregate.kind.eq("spread")]
-    selected = selected[selected.fee_bps.eq(base_fee)].copy()
-    portfolios = selected.assign(组合=np.where(selected.kind.eq("spread"), "最高减最低", "最高分层"),
-                                 持有日数=selected.holding_days, 因子=selected.factor,
-                                 平均年化=percent(selected.mean_annual), 最低年化=percent(selected.min_annual),
-                                 最高年化=percent(selected.max_annual), 平均累计=percent(selected.mean_total),
-                                 平均最大回撤=percent(selected.mean_drawdown),
-                                 平均相对年化=percent(selected.mean_annual_relative),
-                                 跑赢指数轨道=selected.outperform_tracks.map(lambda value: f"{value:.0f}" if pd.notna(value) else "—"))
-    portfolios = portfolios[["因子", "持有日数", "组合", "平均年化", "最低年化", "最高年化", "平均累计",
-                             "平均最大回撤", "平均相对年化", "跑赢指数轨道"]]
-    benchmark_total = benchmark.loc[dates[-1]] / benchmark.loc[dates[0]] - 1
+    short_horizon = min(design["horizons"])
+    short = summary.query('treatment == "neutral" and horizon == @short_horizon').sort_values("icir", ascending=False)
+    signals = pd.DataFrame({
+        "因子": short.factor,
+        "平均 Rank IC": short.mean_rank_ic.map("{:.4f}".format),
+        "ICIR": short.icir.map("{:.3f}".format),
+        "正 IC 占比": percent(short.share_ic_positive),
+        "单日 &#124;t&#124; > 2 占比": percent(short.share_abs_t_gt_2),
+    })
+    leaders = " 和 ".join(short.factor.head(2))
+    index_nav = benchmark_nav(benchmark, dates)
+    benchmark_total = index_nav.iloc[-1] - 1
     benchmark_annual = (1 + benchmark_total) ** (252 / len(dates)) - 1
-    inputs_with_next_session = int(frame.trade_date.lt(dates[-1]).sum())
-    missing_next = inputs_with_next_session - int(frame.next_session_observed.sum())
-    main = summary[summary.horizon.eq(main_horizon)]
-    main_tracks = selected[selected.holding_days.eq(main_horizon) & selected.kind.eq("layer")]
-    check = daily.groupby("horizon").agg(min_ic=("n_ic", "min"), min_wls=("n_wls", "min"))
-    coverage = ", ".join(f"{int(horizon)}日={len(window)}个信号日" for horizon, window in ranges.items())
-    ic_passed = summary.loc[summary.ic_holm_p.lt(.05), ["factor", "treatment", "horizon"]]
-    passed = "、".join(f"{factor} {kind} {horizon}日" for factor, kind, horizon in ic_passed.itertuples(index=False, name=None))
-    slope_passed = int(summary.return_holm_p.lt(.05).sum())
-    top_risk = selected.loc[selected.holding_days.eq(main_horizon)].copy()
-    index_nav = benchmark.reindex(dates) / benchmark.loc[dates[0]]
-    primary_nav = nav.query('holding_days == @main_horizon and fee_bps == @base_fee and kind == "layer" and number == 1')
+    top_filter = 'kind == "layer" and number == 1 and fee_bps == @base_fee'
+    primary_filter = top_filter + ' and holding_days == @main_horizon'
+    top_layers = aggregate.query(top_filter).sort_values(["holding_days", "mean_annual"], ascending=[True, False])
+    primary = top_layers.loc[top_layers.holding_days.eq(main_horizon)].set_index("factor", drop=False)
+    best = primary.iloc[0]
+    alpha13 = primary.loc["Alpha13"]
+    portfolios = pd.DataFrame({
+        "换仓周期": top_layers.holding_days.map("{} 日".format),
+        "因子": top_layers.factor,
+        "平均年化": percent(top_layers.mean_annual),
+        "平均累计收益": percent(top_layers.mean_total),
+        "平均最大回撤": percent(top_layers.mean_drawdown),
+        "跑赢指数的轨道": top_layers.outperform_tracks.map("{:.0f}".format) + "/" + top_layers.n_tracks.astype(str),
+    })
+    primary_nav = nav.query(primary_filter)
     relative_rows = []
-    for (factor, offset), path in primary_nav.groupby(["factor", "offset"]):
+    for key, path in primary_nav.groupby(["factor", "offset"]):
+        factor, offset = cast(tuple[str, int], key)
         path = path.set_index("trade_date").reindex(dates)
         excess = path.daily_return - index_nav.pct_change().fillna(0)
         relative_nav = path.nav / index_nav
@@ -164,45 +140,92 @@ def write_report(
         relative_rows.append(dict(factor=factor, offset=offset, relative_dd=relative_dd,
                                   information_ratio=np.sqrt(252) * excess.mean() / excess.std(ddof=1),
                                   relative_calmar=relative_annual / abs(relative_dd) if relative_dd < 0 else np.nan))
-    relative_stats = pd.DataFrame(relative_rows).groupby("factor").mean()
-    primary_tracks = tracks.query('holding_days == @main_horizon and fee_bps == @base_fee and kind == "layer" and number == 1')
+    relative_stats = cast(pd.DataFrame, pd.DataFrame(relative_rows).groupby("factor").mean())
+    primary_tracks = tracks.query(primary_filter)
     relative_stats["two_way_turnover"] = 2 * primary_tracks.groupby("factor").annual_turnover_one_way.mean()
     main_relative = relative_stats.reset_index().assign(
         因子=lambda table: table.factor, 相对最大回撤=lambda table: percent(table.relative_dd),
         信息比率=lambda table: table.information_ratio.map("{:.2f}".format),
         相对Calmar=lambda table: table.relative_calmar.map("{:.2f}".format),
-        年均双边换手_倍=lambda table: table.two_way_turnover.map("{:.2f}".format))
-    main_relative = main_relative[["因子", "相对最大回撤", "信息比率", "相对Calmar", "年均双边换手_倍"]]
-    top_risk = top_risk.assign(因子=top_risk.factor, 组合=np.where(top_risk.kind.eq("spread"), "最高减最低", "最高分层"),
-                               平均夏普=top_risk.mean_sharpe.map(lambda value: f"{value:.2f}"),
-                               平均月胜率=percent(top_risk.mean_month_win))[["因子", "组合", "平均夏普", "平均月胜率"]]
-    lines = ["# 中证500：量价因子方法复现", "",
-             f"本实验在 {dates[0]:%Y-%m-%d}—{dates[-1]:%Y-%m-%d} 的动态中证500上，对三个量价因子应用[原报告]({SOURCE}#page=10)的回归与分层方法。原报告为2010—2019年全A股；本实验不是对其数字的重现。",
-             "", "## 每日回归与 IC", "",
-             f"使用复权收盘收益，按各期限剔除日历越界：{coverage}。`raw` 为中位数去极值后标准化，`neutral` 再剔除行业和对数总市值暴露后标准化。收益回归控制行业和对数总市值，以流通市值平方根作为 WLS 权重；每日 t 值用该日回归的常规 WLS 标准误。平均 IC 以小数转百分数展示，不是收益率。ICIR 不年化。",
-             "", markdown_table(regressions), "",
-             f"[每日数据]({artifacts}/daily_factor_tests.csv)包含样本数、斜率、标准误及 t 值；[完整汇总]({artifacts}/factor_summary.csv)另给均值的 HAC(20) 标准误和 p 值。IC 和斜率各自对全部18项做 Holm 校正。它们是附加检验，不等于原报告的每日 t 值。",
-             f"通过 0.05 门槛的平均 IC：{passed or '无'}。平均回归斜率通过校正的规格为 {slope_passed} 项。",
-             "", "## 分层回测", "",
-             f"行业市值中性化后按分数从高到低均分 {layer_count} 层，同分按股票代码排序；第一层最高。每层目标等权，按下一交易日收盘尝试换仓。默认单边 {base_fee}bp；每个调仓间隔跑完所有起始日。按252日折算年化，表中的均值是各轨道结果的算术平均。相对收益按策略/基准净值计算。同期中证500价格指数累计 {benchmark_total:.2%}、年化 {benchmark_annual:.2%}。",
-             "", markdown_table(portfolios), "",
-             f"{main_horizon}日主设置的风险和月胜率（按各轨道取均值，无风险利率为零）：", "", markdown_table(top_risk), "",
-             "最高分层相对指数的风险和换手（轨道均值，信息比率用日主动收益计算）：", "", markdown_table(main_relative), "",
-             f"[全部分层与费率结果]({artifacts}/portfolio_summary.csv) · [逐轨道指标]({artifacts}/portfolio_tracks.csv) · [执行对照]({artifacts}/execution_comparison.csv) · [极端层及价差日净值]({artifacts}/nav.parquet)",
-             "", f"![{main_horizon}日分层年化]({artifacts}/layer_returns.svg)", "",
-             f"![最高分层和模拟价差净值]({artifacts}/portfolio_curves.svg)", "",
-             f"![{main_horizon}日最高分层的调仓起始日对照]({artifacts}/rebalance_offsets.svg)", "",
-             f"每个点是一条 {main_horizon} 日调仓、单边 {base_fee}bp 的最高分层轨道。横轴从第一个信号日开始，按相差的交易日数编号；彩色实线是各轨道的平均年化，黑色虚线是同期基准年化。",
-             "最高减最低按每日两条组合净收益之差复利，为研究性价差。两条腿各自为扣费多头，减去最低层净收益不等同真实做空费用，且不含融券可得性与借券成本。附表也固定比较了不同持股数以及最高层的10/15/20bp费用情景。执行对照保留原Alpha13五分组，在15bp下依次比较原分数开盘、原分数收盘及中性分数收盘；进入二十层还会改变组合集中度。",
-             "", "## 口径与数据限制", "",
-             f"- 无完整历史ST/PT和停牌事件表。回归和IC以次日有正常行情近似排除停牌（在有下一交易日的范围内，{missing_next:,}条成员记录没有通过该代理）；只作为事后统计样本掩码。因子计算、预处理及组合目标不读取次日数据。报告不把缺行情认定为确切停牌。",
-             f"- 单日IC、WLS均要求至少{design['min_pairs']}对；各期限有效天内，最少 IC 配对和 WLS 配对分别为 {int(check.min_ic.min())} 和 {int(check.min_wls.min())}。行情用原项目的动态成员、原始价格和信号日成员排名参照。成员和行业只有近似的历史可得性；本样本曾用于研究，不是完全未接触的样本外区间。",
-             "- 收盘涨停不买、跌停不卖，缺有效收盘价或官方限价不成交。卖不出的清仓单以后重试，未成交的新买单不补买；缺有效收盘用上一个可用收盘估值。不重建集合竞价可成交量、冲击、整手、公司行动现金与退市清算。原文未完整披露这些成交细节，属本实验约定。",
-             "- 原文也考查其他中性化组合及参数；本轮只比较不中性与行业/市值中性，不复制依赖额外风格数据的设定，也不调参去追原报告收益。指数是价格指数。",
-             "", f"主20日口径共 {len(main)} 个因子/预处理回归及 IC 组合、{int(main_tracks.n_tracks.sum())} 条最高分层轨道。",
-             "", f"复现：`python -B -m src.scripts.run_factor_study`。参数在 [design.json]({artifacts}/design.json)，输入版本在 [manifest.json]({artifacts}/manifest.json)。"]
-    REPORT.parent.mkdir(exist_ok=True)
-    REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        年均双边换手=lambda table: table.two_way_turnover.map("{:.2f} 倍".format))
+    main_relative = main_relative.loc[:, ["因子", "相对最大回撤", "信息比率", "相对Calmar", "年均双边换手"]]
+    return f"""{FACTOR_HEADING}
+
+本节使用 {layer_count} 层等权和下述成交口径。参与五日 Top-50 对比的同名因子采用对应的 Top-50 策略规则。
+
+**{leaders} 对短期收益的排序表现更好。** 按每 {main_horizon} 个交易日调仓、单边 {base_fee} bp 的主设定买入最高分层，表现最好的 {best.factor} 平均年化为 **{best.mean_annual:.2%}**，低于同期中证500价格指数的 **{benchmark_annual:.2%}**。
+
+研究使用 {dates[0]:%Y-%m-%d} 至 {dates[-1]:%Y-%m-%d} 的动态中证500成分股，用{factor_prices}计算 Alpha3、Alpha13 和 Alpha44。回归、Rank IC 和分层回测参照华泰证券的单因子研究方法。 [华泰原研报]({SOURCE}#page=10)
+
+### 因子分数能否排对顺序
+
+Rank IC 衡量因子分数与未来收益的排序是否一致，加权回归则检验控制行业和市值后，分数与未来收益的关系。下表列出剔除行业和市值影响后的 {short_horizon} 日检验结果。前两名因子的 Rank IC 在超过六成交易日为正，而各因子的回归 `|t|` 超过 2 的日期约占一到两成。
+
+**表　传统单因子的横截面回归与 Rank IC 检验**
+
+{markdown_table(signals)}
+
+### 买入最高分层后赚了多少
+
+股票按中性化后的分数分成 {layer_count} 层，每层目标等权。信号发出后，下一交易日按复权 VWAP 买入，按复权收盘价卖出并估值。每个换仓周期都跑完所有调仓起始日，再汇总最高分层各轨道的收益、最大回撤和跑赢指数的次数。同期中证500价格指数累计上涨 **{benchmark_total:.2%}**。
+
+**表　传统单因子最高分层在各调仓周期的绩效**
+
+{markdown_table(portfolios)}
+
+![{main_horizon} 日换仓下的逐日平均净值]({artifacts}/portfolio_curves.svg)
+
+**图 F1　最高分层与模拟价差的逐日平均净值。** 换仓周期为 {main_horizon} 个交易日，单边费用为 {base_fee} bp。每条因子曲线取 `offset=0` 至 `{main_horizon - 1}` 的 {main_horizon} 条轨道在同一交易日的平均净值。上图为最高分层，黑色虚线为中证500价格指数。下图为最高层减最低层的模拟价差。
+
+各层收益起伏明显，有些低分层的年化也高于最高分层。即使只看最高层，起始日不同，结果也相差很大。例如 Alpha13 的年化从 **{alpha13.min_annual:.2%}** 到 **{alpha13.max_annual:.2%}**。
+
+![各层平均年化收益]({artifacts}/layer_returns.svg)
+
+**图 F2　各因子分层的平均年化收益。** 换仓周期为 {main_horizon} 个交易日，单边费用为 {base_fee} bp。横轴为分层编号，第 1 层的因子分数最高。每个点是对应层在 {main_horizon} 个调仓起始日下的年化收益均值。
+
+![不同调仓起始日的年化收益]({artifacts}/rebalance_offsets.svg)
+
+**图 F3　最高分层在不同调仓起始日下的年化收益。** 换仓周期为 {main_horizon} 个交易日，单边费用为 {base_fee} bp。横轴为距首个信号日的交易日数，每个点是一条轨道的年化收益。彩色实线为各因子所有轨道的平均年化，黑色虚线为同期中证500价格指数的年化收益。子图标题列出跑赢指数的轨道数和总轨道数。
+
+### 数据与复现
+
+结论对应本研究的历史样本与模拟成交条件。回测考虑交易费率和涨跌停限制，历史成分、行业和停牌状态受数据可得性约束。图中的价差来自最高层和最低层的日收益之差。
+
+VWAP 按当日成交额除以成交股数计算。全天处于涨停的股票不买入。账本按日结算，同日卖出款可用于买入，目标份额按收盘价估算。执行对照固定收盘卖出，比较收盘买入与 VWAP 买入。
+
+- [因子检验汇总]({artifacts}/factor_summary.csv) · [逐日回归与 Rank IC]({artifacts}/daily_factor_tests.csv)
+- [分层回测汇总]({artifacts}/portfolio_summary.csv) · [逐轨道结果]({artifacts}/portfolio_tracks.csv) · [执行对照]({artifacts}/execution_comparison.csv) · [逐日净值]({artifacts}/nav.parquet)
+- 复现命令为 `python -B -m src.scripts.run_factor_study`。 [研究参数]({artifacts}/design.json) · [输入版本]({artifacts}/manifest.json)
+
+<details>
+<summary>最高分层相对指数的补充指标</summary>
+
+**表　传统单因子最高分层的相对绩效与换手率**
+
+{markdown_table(main_relative)}
+
+</details>
+"""
+
+
+def saved_factor_section(report: Path) -> str:
+    """读取已保存的单因子结果，供模型研究更新统一报告时使用。"""
+    files = ["factor_summary.csv", "portfolio_summary.csv", "portfolio_tracks.csv", "nav.parquet", "design.json"]
+    if not all((OUT / name).is_file() for name in files):
+        return ""
+    summary, aggregate, tracks = (pd.read_csv(OUT / name) for name in files[:3])
+    nav = pd.read_parquet(OUT / files[3])
+    dates = pd.DatetimeIndex(nav.trade_date.unique()).sort_values()
+    design = json.loads((OUT / files[4]).read_text())
+    return factor_section(summary, aggregate, tracks, nav, load_benchmark(INPUTS["benchmark"]), dates, design, report)
+
+
+def update_factor_section(report: Path, section: str) -> None:
+    """在统一报告中更新末尾的单因子结果，保留前面的模型研究。"""
+    current = report.read_text(encoding="utf-8") if report.exists() else "# 中证500选股研究"
+    previous = current.partition(f"\n{FACTOR_HEADING}\n")[0]
+    report.parent.mkdir(exist_ok=True)
+    report.write_text(number_table_captions(previous.rstrip() + "\n\n" + section), encoding="utf-8")
 
 
 def plot_results(aggregate: pd.DataFrame, nav: pd.DataFrame, benchmark: pd.Series, design: dict) -> None:
@@ -227,8 +250,8 @@ def plot_results(aggregate: pd.DataFrame, nav: pd.DataFrame, benchmark: pd.Serie
         axis.axhline(1, color="0.7", linewidth=1)
         axis.set_ylabel("Top layer NAV" if kind == "layer" else "Spread NAV")
         axis.legend(loc="best")
-    base = benchmark.reindex(path.index)
-    axes[0].plot(base.index, base / base.iloc[0], color="black", linestyle="--", label="CSI 500 price index")
+    base = benchmark_nav(benchmark, pd.DatetimeIndex(view["trade_date"].unique()).sort_values())
+    axes[0].plot(base.index, base, color="black", linestyle="--", label="CSI 500 price index")
     axes[0].legend(loc="best")
     fig.savefig(OUT / "portfolio_curves.svg", bbox_inches="tight")
     plt.close(fig)
@@ -241,7 +264,8 @@ def plot_rebalance_offsets(
     factors = sorted(design["factors"])
     holding, fee = design["main_holding_days"], design["main_fee_bps"]
     top = tracks.query('kind == "layer" and number == 1 and holding_days == @holding and fee_bps == @fee')
-    index_annual = ((benchmark.loc[dates[-1]] / benchmark.loc[dates[0]]) ** (252 / len(dates)) - 1) * 100
+    index_end = benchmark_nav(benchmark, dates).iloc[-1]
+    index_annual = (index_end ** (252 / len(dates)) - 1) * 100
     fig, axes = plt.subplots(len(factors), 1, figsize=(8, 6), sharex=True, sharey=True, squeeze=False)
     for color_number, (factor, axis) in enumerate(zip(factors, axes[:, 0])):
         results = top[top.factor.eq(factor)]
@@ -262,31 +286,39 @@ def plot_rebalance_offsets(
 
 
 def main() -> None:
+    """读取研究配置，依次生成单因子检验、分层回测和报告。"""
     design_file = OUT / "design.json"
     design = json.loads(design_file.read_text())
     print("Preparing factor and market data", flush=True)
+    # 这里frame是每只股票每天一行的长表df
+    # panel是ResearchPanel，可以根据需要取出不同数据的行情矩阵
+    # dates是交易日历DatetimeIndex
     frame, panel, dates = prepare_study(design)
     ranges = {horizon: dates[:-horizon] for horizon in design["horizons"]}
     print("Computing daily rank IC and weighted regressions", flush=True)
     daily = daily_factor_tests(frame, design["factors"], design["horizons"], design["min_pairs"])
-    daily = pd.concat([daily[daily.horizon.eq(horizon) & daily.trade_date.isin(window)]
+    daily = pd.concat([daily.loc[daily["horizon"].eq(horizon) & daily["trade_date"].isin(window.to_list()), :]
                        for horizon, window in ranges.items()], ignore_index=True)
-    summary = summarize_factor_tests(daily, dates)
+    summary = summarize_factor_tests(daily)
     daily.to_csv(OUT / "daily_factor_tests.csv", index=False)
     summary.to_csv(OUT / "factor_summary.csv", index=False)
-    open_quotes, close_quotes, benchmark = market_inputs(frame, panel, dates)
-    tracks, nav = run_layer_tracks(frame, close_quotes, benchmark, design)
+    close_quotes, buy_quotes, benchmark = market_inputs(frame, panel, dates)
+    # tracks和nav均包含factor, holding_days, offset, fee_bps, kind, number
+    # 分别指因子、调仓周期、偏移、单边交易费率、组合类型（layer 或 spread）和组合编号
+    # tracks除了这6个含义列，还有15个指标列，包括年化收益、夏普等等。只要确定这6个含义就能唯一确定一条轨道
+    # nav除了这6个含义列，还包括交易日历。每日收益
+    tracks, nav = run_layer_tracks(frame, close_quotes, benchmark, design, buy_quotes=buy_quotes)
     aggregate = summarize_tracks(tracks)
     tracks.to_csv(OUT / "portfolio_tracks.csv", index=False)
     aggregate.to_csv(OUT / "portfolio_summary.csv", index=False)
     nav.to_parquet(OUT / "nav.parquet", index=False)
-    compare_execution(frame, open_quotes, close_quotes, benchmark, design).to_csv(OUT / "execution_comparison.csv", index=False)
+    compare_execution(frame, close_quotes, buy_quotes, benchmark, design).to_csv(OUT / "execution_comparison.csv", index=False)
     plot_results(aggregate, nav, benchmark, design)
     plot_rebalance_offsets(tracks, benchmark, dates, design)
-    write_report(summary, aggregate, tracks, nav, benchmark, dates, ranges, frame, daily, design)
-    manifest = {str(path.relative_to(ROOT)): hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
-                for path in [*INPUTS.values(), design_file]}
+    manifest = {str(path.relative_to(ROOT)): sha256(path) for path in [*INPUTS.values(), design_file]}
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    section = factor_section(summary, aggregate, tracks, nav, benchmark, dates, design, REPORT)
+    update_factor_section(REPORT, section)
     print(f"Finished: {REPORT}", flush=True)
 
 

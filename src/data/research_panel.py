@@ -1,22 +1,40 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 DateValues = pd.Series | pd.Index | np.ndarray | Sequence[date | str | int]
+ROOT = Path(__file__).resolve().parents[2]
+CSI500_INPUTS = {
+    "prices": ROOT / "data/processed/daily/csi500_processed_daily.parquet",
+    "membership": ROOT / "data/processed/universe/csi500_membership.parquet",
+    "calendar": ROOT / "data/raw/calender/trade_calender_2016_2025.parquet",
+    "caps": ROOT / "data/reference/csi500/daily_basic.parquet",
+    "industries": ROOT / "data/reference/csi500/industry_history.parquet",
+    "limits": ROOT / "data/reference/csi500/stk_limit.parquet",
+    "benchmark": ROOT / "data/reference/csi500/benchmark.csv",
+}
+
+
+def as_date_index(values: DateValues) -> pd.DatetimeIndex:
+    """把一维日期数据转为日期索引，保留原有日期顺序。"""
+    if isinstance(values, pd.DatetimeIndex):
+        return values
+    return pd.DatetimeIndex(pd.Series(values).to_numpy(), name=getattr(values, "name", None))
 
 
 def parse_dates(values: DateValues) -> pd.Series:
     """输入一维日期，如 `["20230103", "20230104"]`；返回重新编号的日期列。"""
     # 丢弃输入的旧标签并重新编号，不保存旧标签结果作为新列
-    values = pd.Series(values).reset_index(drop=True)
+    date_series = pd.Series(values).reset_index(drop=True)
     # 如果输入是日期类型直接转换，否则先转string再处理
-    if pd.api.types.is_datetime64_any_dtype(values):
-        result = pd.to_datetime(values, errors="raise")
+    if pd.api.types.is_datetime64_any_dtype(date_series):
+        result = pd.to_datetime(date_series, errors="raise")
     else:
-        text = values.astype("string")
+        text = date_series.astype("string")
         # 检查values是否都是类似"20230103"的8位数字标准格式
         if not text.str.fullmatch(r"\d{8}").fillna(False).all():
             raise ValueError("Dates must be datetime values or exactly YYYYMMDD")
@@ -28,6 +46,17 @@ def parse_dates(values: DateValues) -> pd.Series:
     return result
 
 
+def load_market_calendar(path: Path) -> pd.DatetimeIndex:
+    """读取含 cal_date 的日历 Parquet 表，返回升序交易日索引。
+
+    若表中包含 is_open，只保留开市日。
+    """
+    frame = pd.read_parquet(path)
+    if "is_open" in frame:
+        frame = frame.loc[frame.is_open.astype(int).eq(1)]
+    return pd.DatetimeIndex(parse_dates(frame.cal_date)).sort_values()
+
+
 @dataclass
 class ResearchPanel:
     """`daily` 是股票日行情长表，`calendar` 和 `tickers` 定义宽表的行列。"""
@@ -36,16 +65,13 @@ class ResearchPanel:
     calendar: pd.DatetimeIndex
     tickers: pd.Index
 
-    def matrix(self, column: str, clean: bool = True) -> pd.DataFrame:
+    def matrix(self, column: str) -> pd.DataFrame:
         """取 `daily` 的一个字段，例如 `close_adj`，返回 [交易日 × 股票] 宽表。
 
-        行索引是交易日，列名是股票代码。clean=True 时屏蔽非 observed 行情。
+        行索引是交易日，列名是股票代码。非 observed 行情记为 NaN。
         """
         data = self.daily
-        values = data[column]
-        if clean:
-            # 满足条件保留原值，否则换成NaN。即将非observed的数据换成NaN
-            values = values.where(data.observation_status.eq("observed"))
+        values = data[column].where(data.observation_status.eq("observed"))
         # assign是往原两列数据中添加一列，随后pivot将其转换成矩阵
         # 其中index是行索引，columns是列索引，values是对应数值
         # reindex这里，使用全交易日日期和全股票，没有数据的部分自动补充NaN
@@ -99,11 +125,15 @@ def prepare_panel(daily: pd.DataFrame, calendar: DateValues) -> ResearchPanel:
     # 计算复权价格
     for column in ["open", "high", "low", "close"]:
         data[column + "_adj"] = data[column] * data.adj_factor / anchor
+    # Tushare 的成交额为千元，成交量为手，每手 100 股。
+    vwap = 10 * data.amount / data.vol.where(valid)
+    vwap = vwap.where(vwap.between(data.low - .01, data.high + .01))
+    data["vwap_adj"] = vwap * data.adj_factor / anchor
     # 非observed的数据，要么数据本身有问题，要么交易量为0
     data["observation_status"] = np.where(valid, "observed", "invalid_input")
     data.loc[data.vol.eq(0), "observation_status"] = "no_trade"
     # 注意这里才根据交易日历截断数据
-    data = data[data.trade_date.isin(dates)].copy()
+    data = data.loc[data["trade_date"].isin(dates.to_list()), :].copy()
     # 这里返回的ticker是所有daily数据中都出现过的ticker，不是只在交易日历内出现的ticker
     return ResearchPanel(data, dates, pd.Index(sorted(daily.ticker.unique()), name="ticker"))
 
@@ -115,7 +145,7 @@ def prepare_membership(membership: pd.DataFrame) -> pd.DataFrame:
     """
     data = membership.copy()
     for column in ["trade_date", "source_snapshot_date"]:
-        data[column] = parse_dates(data[column]).to_numpy()
+        data[column] = parse_dates(pd.Series(data[column])).to_numpy()
     if data.ticker.isna().any() or data.duplicated(["ticker", "trade_date"]).any():
         raise ValueError("Invalid membership key")
     # 这里确保取每个交易日时，应该采用历史快照，而不能使用未来的快照

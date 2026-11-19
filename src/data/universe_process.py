@@ -18,7 +18,7 @@ trade_date = trade_date.to_frame(name='trade_date').sort_values('trade_date')
 df = df.rename(columns={'con_code' : 'ticker', 'trade_date' : 'snapshot_date'})
 df['snapshot_date'] = pd.to_datetime(df['snapshot_date'])
 df = df.dropna().drop_duplicates()
-snapshot_date = df[['snapshot_date']].sort_values('snapshot_date')
+snapshot_date = df.loc[:, ['snapshot_date']].sort_values('snapshot_date')
 
 merge_date_df = (
     pd.merge_asof(trade_date, snapshot_date, direction='backward', left_on='trade_date', right_on='snapshot_date')

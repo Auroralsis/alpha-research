@@ -5,11 +5,11 @@ import numpy as np
 import pandas as pd
 from numpy.typing import ArrayLike
 
-from src.data.research_panel import DateValues
+from src.data.research_panel import DateValues, parse_dates
 
 
 def mad_clip(values: ArrayLike, multiple: float = 5) -> pd.Series:
-    """输入一维截面数值，按中位数 ± multiple × MAD 截断，保留原行索引。"""
+    """输入一维截面数值，按中位数 ± multiple x MAD 截断，保留原行索引。"""
     values = pd.Series(values, copy=True, dtype=float)
     median = values.median()
     mad = (values - median).abs().median()
@@ -39,7 +39,7 @@ def neutralize(
                        pd.Series(industry).rename("industry")], axis=1)
     result = pd.Series(np.nan, index=frame.index, dtype=float)
     if known_at is not None:
-        if signal_date is None or (pd.to_datetime(known_at).dropna() > pd.Timestamp(signal_date)).any():
+        if signal_date is None or (pd.to_datetime(pd.Series(known_at)).dropna() > pd.Timestamp(signal_date)).any():
             raise ValueError("Controls are not known by the signal time")
     frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
     frame = frame[frame.cap > 0]
@@ -54,6 +54,22 @@ def neutralize(
     residual = y.to_numpy() - design @ np.linalg.lstsq(design, y.to_numpy(), rcond=None)[0]
     result.loc[frame.index] = standardize(pd.Series(residual, index=frame.index))
     return result
+
+
+def attach_neutral_scores(
+    frame: pd.DataFrame, caps: pd.DataFrame, history: pd.DataFrame, factors: Sequence[str],
+) -> pd.DataFrame:
+    """给逐股因子长表补上信号日的行业、市值和各因子的中性化分数。"""
+    caps = caps.rename(columns={"ts_code": "ticker"})
+    caps["trade_date"] = parse_dates(caps.trade_date).to_numpy()
+    frame = frame.merge(caps, on=["ticker", "trade_date"], how="left", validate="one_to_one")
+    frame["industry"] = align_industry_history(frame, history)
+    for factor in factors:
+        frame[f"{factor}_neutral"] = np.nan
+    for _, group in frame.groupby("trade_date"):
+        for factor in factors:
+            frame.loc[group.index, f"{factor}_neutral"] = neutralize(group[factor], group.total_mv, group.industry)
+    return frame
 
 
 def align_industry_history(keys: pd.DataFrame, history: pd.DataFrame) -> pd.Series:

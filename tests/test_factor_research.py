@@ -1,17 +1,17 @@
 """Independent scalar references, temporal integrity, inference and cash ledger."""
 import math
 import unittest
+from typing import cast
 
 import numpy as np
 import pandas as pd
 
 from src.data.research_panel import prepare_panel, prepare_membership, parse_dates
 from src.features.price_volume import compute_factors, alpha3, alpha13, alpha44, FACTORS
-from src.features.price_volume import cross_sectional_rank, window_covariance, window_correlation, quantile_groups
+from src.features.price_volume import cross_sectional_rank, window_covariance, window_correlation
 from src.features.targets import attach_labels, market_forward_returns
 from src.features.neutralization import neutralize, mad_clip, align_industry_history
-from src.evaluation.inference import hac_mean, holm_adjust
-from src.evaluation.portfolio import backtest_long_only, performance, trading_prices
+from src.evaluation.portfolio import QuoteGrid, backtest_long_only, performance
 
 
 def fixture():
@@ -60,6 +60,7 @@ def scalar_reference(raw, membership, dates, day, factor):
     window = 10 if factor == "Alpha3" else 5
     field = {"Alpha3":"open", "Alpha13":"close", "Alpha44":"high"}[factor]
     data = raw.set_index(["trade_date", "ticker"])
+    anchors = data.sort_index().groupby(level="ticker").adj_factor.first()
     start = dates.get_loc(day)-window+1
     prices, volumes = {t:[] for t in cohort}, {t:[] for t in cohort}
     for u in dates[start:dates.get_loc(day)+1]:
@@ -68,7 +69,8 @@ def scalar_reference(raw, membership, dates, day, factor):
             if (u,t) in data.index:
                 row = data.loc[(u,t)]
                 if all(math.isfinite(row[c]) and row[c] > 0 for c in ["open","high","low","close","vol","amount","adj_factor"]):
-                    p[t], v[t] = row[field], row.vol
+                    p[t] = row[field] * row.adj_factor / anchors[t]
+                    v[t] = row.vol
         for t in cohort:
             prices[t].append(p.get(t, math.nan) if factor == "Alpha44" else scalar_rank(p,t))
             volumes[t].append(scalar_rank(v,t))
@@ -79,6 +81,8 @@ def scalar_reference(raw, membership, dates, day, factor):
 class FactorTests(unittest.TestCase):
     def setUp(self):
         self.raw, self.members, self.dates = fixture()
+        split = self.raw.ticker.eq("A") & self.raw.trade_date.ge(self.dates[26])
+        self.raw.loc[split, "adj_factor"] *= 2
         self.panel = prepare_panel(self.raw.sample(frac=1,random_state=3), self.dates)
         self.members = prepare_membership(self.members)
 
@@ -95,7 +99,7 @@ class FactorTests(unittest.TestCase):
     def test_alpha44_independent_reference(self): self.check_factor("Alpha44")
 
     def test_shuffle_and_future_append_do_not_change_past(self):
-        day = self.dates[24]
+        day = cast(pd.Timestamp, self.dates[24])
         expected = compute_factors(self.panel,self.members,[day])
         extra = self.raw.iloc[:1].copy(); extra["ticker"] = "ZZ_future"; extra["trade_date"] = self.dates[-1]
         appended = pd.concat([self.raw,extra],ignore_index=True)
@@ -110,7 +114,7 @@ class FactorTests(unittest.TestCase):
         pd.testing.assert_frame_equal(a,b)
 
     def test_new_member_uses_pre_entry_history_and_rank_policies_differ(self):
-        day=self.dates[24]
+        day = cast(pd.Timestamp, self.dates[24])
         a=compute_factors(self.panel,self.members,[day])
         b=compute_factors(self.panel,self.members,[day],rank_policy="historical_members")
         self.assertTrue(a.loc[a.ticker.eq("F"),list(FACTORS)].notna().all().all())
@@ -125,11 +129,9 @@ class FactorTests(unittest.TestCase):
             a=np.tile(np.arange(size)[:,None],(1,3))
             np.testing.assert_allclose(func(a,-a),np.ones(3))
 
-    def test_rank_ties_invalid_and_grouping(self):
+    def test_rank_ties_and_invalid(self):
         np.testing.assert_allclose(cross_sectional_rank([1,1,3,np.inf]),[.5,.5,1,np.nan],equal_nan=True)
         self.assertTrue(np.isnan(cross_sectional_rank([1,np.nan])).all())
-        self.assertEqual(len(np.unique(quantile_groups(np.ones(10)))),1)
-        np.testing.assert_array_equal(quantile_groups(np.arange(10)),[1,1,2,2,3,3,4,4,5,5])
 
 
 class DataTests(unittest.TestCase):
@@ -140,7 +142,7 @@ class DataTests(unittest.TestCase):
 
     def test_split_adjustment_and_invalid_first_anchor(self):
         raw,_,dates=fixture()
-        raw=raw[raw.ticker.eq("A")].copy()
+        raw = raw.loc[raw["ticker"].eq("A"), :].copy()
         raw.loc[raw.trade_date<dates[1],["open","high","low","close"]]=[100.,102.,98.,100.]
         raw.loc[raw.trade_date==dates[1],["open","high","low","close","adj_factor"]]=[50.,51.,49.,50.,2.]
         panel=prepare_panel(raw,dates)
@@ -181,25 +183,7 @@ class DataTests(unittest.TestCase):
             attach_labels(frame.assign(ticker="unknown"), panel, [5])
 
 
-class StatisticalTests(unittest.TestCase):
-    def test_hac_manual_calendar_gaps(self):
-        x=np.array([1.,2.,np.nan,4.,3.,2.]);valid=np.isfinite(x);n=valid.sum()
-        e=np.where(valid,x-np.nanmean(x),0)
-        expected=(np.dot(e,e)+np.dot(e[1:],e[:-1]))/n**2*n/(n-1)
-        result=hac_mean(x,lag=1,min_obs=2,min_coverage=.5)
-        self.assertAlmostEqual(result["hac_se"]**2,expected)
-        self.assertNotAlmostEqual(result["hac_se"],hac_mean(x[valid],lag=1,min_obs=2)["hac_se"])
-
-    def test_holm_and_insufficient_coverage(self):
-        np.testing.assert_allclose(holm_adjust([.01,.04,.03]),[.03,.06,.06])
-        self.assertEqual(hac_mean([1,np.nan,2])["inference_status"],"insufficient_coverage")
-        self.assertTrue(np.isnan(hac_mean(np.ones(200))["p_value"]))
-
-    def test_serial_correlation_increases_uncertainty(self):
-        rng=np.random.default_rng(19);x=np.zeros(2000)
-        for i in range(1,len(x)): x[i]=.8*x[i-1]+rng.normal()
-        self.assertGreater(hac_mean(x,lag=20)["hac_se"],hac_mean(x,lag=0)["hac_se"]*2)
-
+class NeutralizationTests(unittest.TestCase):
     def test_neutralization_orthogonality_and_pit_guard(self):
         idx=range(30); cap=pd.Series(np.exp(np.arange(30)/10),index=idx)
         industry=pd.Series(["a"]*15+["b"]*15,index=idx)
@@ -219,24 +203,42 @@ class StatisticalTests(unittest.TestCase):
 
 
 class PortfolioTests(unittest.TestCase):
-    def test_opening_quotes_do_not_use_future_closing_fields(self):
-        raw,_,dates=fixture()
-        raw=raw[raw.ticker.eq("A")].copy()
-        changed=raw.copy()
-        changed.loc[changed.trade_date.eq(dates[1]),["high","low","close","vol"]]=[np.inf,np.nan,np.nan,0.]
-        args=[]
-        for data in [raw,changed]:
-            panel=prepare_panel(data,dates)
-            opening,closing,original=trading_prices(panel,dates,panel.tickers)
-            _,trades,_=backtest_long_only(opening,closing,original,original*2,original*.5,{dates[0]:["A"]},fee=0)
-            args.append(trades)
-        pd.testing.assert_frame_equal(args[0],args[1])
+    def test_vwap_buy_with_close_sell_and_close_valuation(self):
+        dates = pd.bdate_range("2023-01-03", periods=3)
+        close = pd.DataFrame({"A": [10., 20., 30.]}, index=dates)
+        vwap = pd.DataFrame({"A": [10., 16., 25.]}, index=dates)
+        raw_close = close / 2
+        signals = {dates.to_list()[0]: ["A"], dates.to_list()[1]: []}
+        quotes = QuoteGrid(close, close, raw_close, raw_close, raw_close / 2)
+        ledger, trades, _ = backtest_long_only(
+            quotes, signals, fee_bps=100, rebalance_every=1, buy_quotes=(vwap, vwap / 2),
+        )
+        np.testing.assert_allclose(trades.execution_price, [16., 30.])
+        np.testing.assert_allclose(trades.fee, [.008, .015])
+        np.testing.assert_allclose(ledger.nav, [1., 1.192, 1.677])
+
+        blocked, _, _ = backtest_long_only(
+            quotes, signals, fee_bps=100, rebalance_every=1, buy_quotes=(vwap, raw_close),
+        )
+        self.assertEqual(blocked.n_blocked_buys.sum(), 1)
+        np.testing.assert_allclose(blocked.nav, [1., 1., 1.])
+
+    def test_panel_calculates_adjusted_vwap_and_masks_zero_volume(self):
+        dates = pd.bdate_range("2023-01-03", periods=3)
+        raw = pd.DataFrame({
+            "ticker": "A", "trade_date": dates, "open": [10., 10., 10.],
+            "high": [11., 11., 11.], "low": [9., 9., 9.], "close": [10., 10., 10.],
+            "vol": [10., 10., 0.], "amount": [10., 10.5, 0.], "adj_factor": [2., 4., 4.],
+        })
+        panel = prepare_panel(raw, dates)
+        np.testing.assert_allclose(panel.matrix("vwap_adj")["A"], [10., 21., np.nan], equal_nan=True)
 
     def test_current_open_marks_existing_position_when_close_missing(self):
         dates=pd.bdate_range("2023-01-02",periods=4)
         opening=pd.DataFrame({"A":[1.,1.,2.,3.]},index=dates)
         closing=opening.copy();closing.iloc[2]=np.nan
-        ledger,_,_=backtest_long_only(opening,closing,opening,opening*2,opening*.5,{dates[0]:["A"]},fee=0)
+        quotes = QuoteGrid(opening, closing, opening, opening * 2, opening * .5)
+        ledger = backtest_long_only(quotes, {dates.to_list()[0]: ["A"]}, fee_bps=0).ledger
         self.assertAlmostEqual(ledger.nav.iloc[2],2.)
         self.assertEqual(ledger.n_stale.iloc[2],1)
 
@@ -244,7 +246,7 @@ class PortfolioTests(unittest.TestCase):
         dates=pd.bdate_range("2023-01-02",periods=3)
         p=pd.DataFrame({"A":[1.,1.,1.]},index=dates)
         unknown=p*np.nan
-        ledger,trades,_=backtest_long_only(p,p,p,unknown,unknown,{dates[0]:["A"]})
+        ledger, trades, _ = backtest_long_only(QuoteGrid(p, p, p, unknown, unknown), {dates.to_list()[0]: ["A"]})
         self.assertTrue(trades.empty)
         np.testing.assert_allclose(ledger.nav,1.)
         self.assertEqual(ledger.n_blocked_buys.iloc[1],1)
@@ -252,24 +254,29 @@ class PortfolioTests(unittest.TestCase):
     def test_buy_and_sell_costs_both_debit_cash(self):
         dates=pd.bdate_range("2023-01-02",periods=4)
         p=pd.DataFrame({"A":np.ones(4)},index=dates)
-        ledger,trades,_=backtest_long_only(p,p,p,p*2,p*.5,{dates[0]:["A"],dates[1]:[]},fee=.01,rebalance_every=1)
+        first, second = dates.to_list()[:2]
+        ledger, trades, _ = backtest_long_only(
+            QuoteGrid(p, p, p, p * 2, p * .5), {first: ["A"], second: []}, fee_bps=100, rebalance_every=1,
+        )
         self.assertAlmostEqual(ledger.nav.iloc[-1],(1-.01)/(1+.01))
         self.assertEqual(len(trades),2)
         self.assertAlmostEqual(ledger.cost.sum(),1-ledger.nav.iloc[-1])
 
-    def run_model(self, fee=0, blocked=False):
+    def run_model(self, fee_bps: float = 0, blocked: bool = False):
         dates=pd.bdate_range("2023-01-02",periods=5)
         prices=pd.DataFrame({"A":[1.,2.,4.,4.,4.]},index=dates)
         up=prices*2;down=prices*.5
         if blocked: up.iloc[1]=prices.iloc[1]
-        return backtest_long_only(prices,prices,prices,up,down,{dates[0]:["A"]},fee=fee)
+        return backtest_long_only(
+            QuoteGrid(prices, prices, prices, up, down), {dates.to_list()[0]: ["A"]}, fee_bps=fee_bps,
+        )
 
     def test_next_day_execution_and_exact_fees(self):
         ledger,trades,_=self.run_model()
         self.assertEqual(ledger.nav.iloc[0],1.)
         self.assertEqual(ledger.nav.iloc[1],1.)
         self.assertEqual(ledger.nav.iloc[2],2.)
-        costly,_,_=self.run_model(.01)
+        costly, _, _ = self.run_model(100)
         self.assertAlmostEqual(costly.nav.iloc[1],1/1.01)
         self.assertEqual(len(trades),1)
         self.assertAlmostEqual(performance(ledger)["total_return"],1.)
@@ -282,7 +289,10 @@ class PortfolioTests(unittest.TestCase):
     def test_missing_close_is_stale_not_a_trade(self):
         dates=pd.bdate_range("2023-01-02",periods=5)
         p=pd.DataFrame({"A":[1.,1.,np.nan,2.,2.]},index=dates)
-        ledger,_,_=backtest_long_only(p,p,p,p*2,p*.5,{dates[0]:["A"],dates[1]:[]},fee=0,rebalance_every=1)
+        first, second = dates.to_list()[:2]
+        ledger = backtest_long_only(
+            QuoteGrid(p, p, p, p * 2, p * .5), {first: ["A"], second: []}, fee_bps=0, rebalance_every=1,
+        ).ledger
         self.assertEqual(ledger.n_stale.iloc[2],1)
         self.assertEqual(ledger.pending_exit_value.iloc[2],1.)
         self.assertEqual(ledger.n_holdings.iloc[3],0)

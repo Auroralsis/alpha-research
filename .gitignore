@@ -2,10 +2,15 @@ GIT_COMMANDS.md
 PANDAS_DATAFRAME_GUIDE.md
 
 *.png
+__pycache__/
+*.pyc
 
 tutorials
 tutorials/*
 data/raw/*
 data/interim/*
 data/processed/*
+results/ml_study/*.parquet
+results/ml_study/*/*.parquet
+/.venv-ml/
 .env
