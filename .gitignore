@@ -1,5 +1,6 @@
 GIT_COMMANDS.md
 PANDAS_DATAFRAME_GUIDE.md
+/AGENTS.md
 
 *.png
 __pycache__/
@@ -7,10 +8,13 @@ __pycache__/
 
 tutorials
 tutorials/*
-data/raw/*
-data/interim/*
-data/processed/*
-results/ml_study/*.parquet
-results/ml_study/*/*.parquet
+/data/**
+!/data/reference/
+!/data/reference/csi500/
+!/data/reference/csi500/industry_l1_history.parquet
+!/data/reference/csi500/industry_gap_audit.parquet
+results
+results/*
+tmp
 /.venv-ml/
 .env

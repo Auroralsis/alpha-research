@@ -1,3 +1,5 @@
+"""从日历、成分和行情构建研究面板，并按交易日生成收益标签。"""
+
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -11,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CSI500_INPUTS = {
     "prices": ROOT / "data/processed/daily/csi500_processed_daily.parquet",
     "membership": ROOT / "data/processed/universe/csi500_membership.parquet",
-    "calendar": ROOT / "data/raw/calender/trade_calender_2016_2025.parquet",
+    "calendar": ROOT / "data/raw/calender/trade_calender_2013_2025.parquet",
     "caps": ROOT / "data/reference/csi500/daily_basic.parquet",
-    "industries": ROOT / "data/reference/csi500/industry_history.parquet",
+    "industries": ROOT / "data/reference/csi500/industry_l1_history.parquet",
     "limits": ROOT / "data/reference/csi500/stk_limit.parquet",
     "benchmark": ROOT / "data/reference/csi500/benchmark.csv",
 }
@@ -24,6 +26,11 @@ def as_date_index(values: DateValues) -> pd.DatetimeIndex:
     if isinstance(values, pd.DatetimeIndex):
         return values
     return pd.DatetimeIndex(pd.Series(values).to_numpy(), name=getattr(values, "name", None))
+
+
+def stock_day_index(rows: pd.DataFrame) -> pd.MultiIndex:
+    """把项目的股票日键转换成 Qlib 使用的索引。"""
+    return pd.MultiIndex.from_frame(rows[["trade_date", "ticker"]], names=["datetime", "instrument"])
 
 
 def parse_dates(values: DateValues) -> pd.Series:
@@ -77,12 +84,6 @@ class ResearchPanel:
         # reindex这里，使用全交易日日期和全股票，没有数据的部分自动补充NaN
         return (data[["ticker", "trade_date"]].assign(value=values).pivot(index="trade_date", columns="ticker", values="value")
                 .reindex(index=self.calendar, columns=self.tickers))
-
-    def observation_status(self) -> pd.DataFrame:
-        """返回 [交易日 × 股票] 状态矩阵；没有记录的格子为 no_record_unknown。"""
-        # 这里返回observation_status，fillna时填充"no_record_unknown"
-        return (self.daily.pivot(index="trade_date", columns="ticker", values="observation_status")
-                .reindex(index=self.calendar, columns=self.tickers).fillna("no_record_unknown"))
 
 
 def prepare_panel(daily: pd.DataFrame, calendar: DateValues) -> ResearchPanel:
@@ -153,3 +154,70 @@ def prepare_membership(membership: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Future snapshot used for membership")
     data["approximate_pit"] = True
     return data.sort_values(["trade_date", "ticker"]).reset_index(drop=True)
+
+
+def execution_labels(panel: ResearchPanel, keys: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
+    """给逐股信号长表补上收益端点和复权收盘收益。
+
+    start、end 表示相对信号日的交易日偏移，按市场日历定位价格。
+    """
+    date_pos = panel.calendar.get_indexer(keys.trade_date)
+    ticker_pos = panel.tickers.get_indexer(keys.ticker)
+    if (date_pos < 0).any() or (ticker_pos < 0).any() or not 0 < start < end:
+        raise ValueError("Invalid label keys or offsets")
+    close = panel.matrix("close_adj")
+    calendar = pd.Series(panel.calendar, index=panel.calendar)
+    start_close = close.shift(-start).to_numpy()[date_pos, ticker_pos]
+    end_close = close.shift(-end).to_numpy()[date_pos, ticker_pos]
+    return keys.assign(feature_date=keys.trade_date, label_start_date=keys.trade_date.map(calendar.shift(-start)),
+                       label_end_date=keys.trade_date.map(calendar.shift(-end)), label=end_close / start_close - 1)
+
+
+def segment_masks(rows: pd.DataFrame, segments: dict[str, list[str]]) -> dict[str, pd.Series]:
+    """按阶段返回布尔掩码，要求信号日与收益终点同属该阶段且收益有效。"""
+    boundaries = [(pd.Timestamp(start), pd.Timestamp(end)) for start, end in segments.values()]
+    if any(lo > hi for lo, hi in boundaries) or any(a[1] >= b[0] for a, b in zip(boundaries, boundaries[1:])):
+        raise ValueError("Research splits must be chronologically ordered and disjoint")
+    return {name: rows.trade_date.between(lo, hi) & rows.label_end_date.le(hi) & np.isfinite(rows.label)
+            for name, (lo, hi) in zip(segments, boundaries)}
+
+
+def prepare_inputs(config: dict, *, need_industry: bool = True) -> pd.DatetimeIndex:
+    """按依赖顺序准备日历、成员、行情，以及单因子需要的行业历史。"""
+    from src.data.download import download_calendar, download_industry, download_prices
+    from src.data.universe_process import main as build_members
+
+    if not CSI500_INPUTS["calendar"].is_file():
+        print("补充交易日历与历史成员快照", flush=True)
+        download_calendar()
+    dates = load_market_calendar(CSI500_INPUTS["calendar"])
+    members_path = CSI500_INPUTS["membership"]
+    members = pd.read_parquet(members_path, columns=["trade_date", "ticker"]) if members_path.is_file() else pd.DataFrame()
+    if members.empty or not pd.DatetimeIndex(pd.to_datetime(members.trade_date).unique()).sort_values().as_unit("ns").equals(dates.as_unit("ns")):
+        print("重建覆盖扩展训练期的历史成员表", flush=True)
+        build_members()
+        members = pd.read_parquet(members_path, columns=["trade_date", "ticker"])
+    prices_path = CSI500_INPUTS["prices"]
+    prices = pd.read_parquet(prices_path, columns=["trade_date", "ticker", "adj_factor"]) if prices_path.is_file() else pd.DataFrame()
+    if (prices.empty or pd.to_datetime(prices.trade_date.astype(str)).min() > dates[0]
+            or pd.to_datetime(prices.trade_date.astype(str)).max() < pd.Timestamp(config["segments"]["test"][1])
+            or not set(members.ticker).issubset(prices.ticker)
+            or prices.adj_factor.isna().any()):
+        print("补充历史行情与复权因子，已完成的股票会复用下载检查点", flush=True)
+        download_prices()
+    if need_industry:
+        path = CSI500_INPUTS["industries"]
+        if not path.is_file() or path.stat().st_mtime_ns < members_path.stat().st_mtime_ns:
+            download_industry()
+    return dates
+
+
+def prepare_test_panel(config: dict, market_dates: pd.DatetimeIndex) -> tuple[ResearchPanel, pd.DatetimeIndex]:
+    """读取回测及传统因子预热所需行情，返回测试期交易日。"""
+    start, end = config["segments"]["test"]
+    dates = market_dates[market_dates.to_series().between(start, end).to_numpy()]
+    if dates.empty:
+        raise ValueError("测试期缺少交易日")
+    first = market_dates.get_indexer(dates[:1])[0]
+    working = market_dates[max(first - 21, 0):first + len(dates)]
+    return prepare_panel(pd.read_parquet(CSI500_INPUTS["prices"]), working), dates

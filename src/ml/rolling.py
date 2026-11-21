@@ -8,23 +8,20 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
-from src.ml.models import ROLLING_SCORE, daily_zscore, fit_lightgbm, training_settings
+from src.config import RIDGE_LOSS, normalize_training_label
+from src.data.qlib_provider import register_provider
+from src.ml.dataset import alpha158_columns, fitting_segment, make_dataset, read_feature_split
+from src.ml.models import ROLLING_SCORE, fit_lightgbm, record_test_signal, training_settings
 
 
 def init_rolling_qlib(dates: pd.DatetimeIndex, version: str, out: Path) -> None:
-    """把项目交易日历交给 Qlib，并把实验记录写入 out/mlruns。"""
-    import qlib
-
-    if qlib.__version__ != version:
-        raise RuntimeError(f"Expected Qlib {version}, found {qlib.__version__}")
+    """把项目交易日历和本地记录器交给 Qlib。"""
     calendar_dir = out / "provider" / "calendars"
     calendar_dir.mkdir(parents=True, exist_ok=True)
     text = "\n".join(dates.strftime("%Y-%m-%d")) + "\n"
     for name in ("day.txt", "day_future.txt"):
         (calendar_dir / name).write_text(text)
-    qlib.init(provider_uri=str(calendar_dir.parent), region="cn", expression_cache=None, dataset_cache=None,
-              exp_manager={"class": "MLflowExpManager", "module_path": "qlib.workflow.expm",
-                           "kwargs": {"uri": (out.resolve() / "mlruns").as_uri(), "default_exp_name": "rolling_lightgbm"}})
+    register_provider(calendar_dir.parent, version)
 
 
 def rolling_windows(dates: pd.DatetimeIndex, config: dict, feature_start: pd.Timestamp) -> tuple[list[dict], int]:
@@ -51,7 +48,10 @@ def rolling_windows(dates: pd.DatetimeIndex, config: dict, feature_start: pd.Tim
     target_dates = dates[(dates >= test_start) & (dates <= test_end)]
     if target_dates.empty or not first <= nominal["train"][1] < nominal["validation"][0] <= nominal["validation"][1] < test_start:
         raise ValueError("Rolling study requires nonempty and ordered train, validation and test segments")
-    step = ceil(len(target_dates) / 3)
+    window_count = config.get("rolling_test_windows", 3)
+    if not isinstance(window_count, int) or window_count <= 0:
+        raise ValueError("rolling_test_windows 必须是正整数")
+    step = ceil(len(target_dates) / window_count)
     distance = config["label_end_days"] + 1
     template = {"dataset": {"kwargs": {"segments": segments}}}
     raw_generator = RollingGen(step=step, rtype=RollingGen.ROLL_SD, ds_extra_mod_func=None)
@@ -80,11 +80,9 @@ def rolling_windows(dates: pd.DatetimeIndex, config: dict, feature_start: pd.Tim
 
 def read_window(features: Path, bounds: tuple, dates: pd.DatetimeIndex, config: dict) -> pd.DataFrame:
     """按信号日读取股票特征，并核对已保存的特征日和收益日期。"""
-    begin, end = bounds
-    rows = pd.read_parquet(features, filters=[("trade_date", ">=", begin), ("trade_date", "<=", end)])
-    positions = dates.get_indexer(rows.trade_date)
-    if rows.empty or rows.duplicated(["trade_date", "ticker"]).any() or (positions < 0).any():
-        raise ValueError(f"Invalid feature keys for {begin} to {end}")
+    rows = read_feature_split(features, bounds, "rolling")
+    if (dates.get_indexer(rows.trade_date) < 0).any():
+        raise ValueError(f"Invalid feature keys for {bounds}")
     if not rows.feature_date.le(rows.trade_date).all():
         raise ValueError("Feature date follows the signal")
     if "source_snapshot_date" in rows and not rows.source_snapshot_date.le(rows.trade_date).all():
@@ -99,46 +97,43 @@ def read_window(features: Path, bounds: tuple, dates: pd.DatetimeIndex, config: 
 
 def fit_window(window: dict, config: dict, dates: pd.DatetimeIndex, features: Path, names: list[str],
                out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """用这一轮合法的训练和验证收益拟合模型，只给其测试区间打分。"""
-    import lightgbm as lgb
-
+    """拟合本窗口模型，写入 Qlib 信号记录，返回测试股票日和损失。"""
     out.mkdir(parents=True, exist_ok=True)
     settings = training_settings(config)
     bounds, raw = window["effective"], window["raw"]
-    datasets, audit = [], {}
+    fitting, audit = {}, {}
     for split, next_start in (("train", raw["validation"][0]), ("validation", raw["test"][0])):
         rows = read_window(features, bounds[split], dates, config)
         valid = rows.label_end_date.lt(next_start) & rows.label_end_date.le(raw[split][1]) & np.isfinite(rows.label)
-        eligible = rows.loc[valid]
-        z = daily_zscore(eligible.label, eligible.trade_date)
-        z = z.loc[np.isfinite(z)]
-        values = rows.loc[z.index, names]
-        if z.empty or np.isinf(values.to_numpy(dtype=np.float32)).any():
-            raise ValueError(f"No usable fitting labels or infinite features in {split}")
-        audit[split] = dict(signal_rows=len(rows), fitted_rows=len(z), signal_days=rows.trade_date.nunique(),
-                            valid_label_rows=int(valid.sum()), fitted_signal_start=rows.loc[z.index, "trade_date"].min(),
-                            fitted_signal_end=rows.loc[z.index, "trade_date"].max(),
-                            latest_label_end=rows.loc[z.index, "label_end_date"].max())
-        datasets.append(lgb.Dataset(values, label=z))
-        del rows, eligible
+        frame, target = fitting_segment(rows, names, valid, settings["training_label"], split)
+        if np.isinf(frame["feature"].to_numpy(dtype=np.float32)).any():
+            raise ValueError(f"Infinite Alpha158 inputs in {split}")
+        fitted = rows.loc[target.index, ["trade_date", "label_end_date"]]
+        audit[split] = dict(signal_rows=len(rows), fitted_rows=len(target), signal_days=rows.trade_date.nunique(),
+                            valid_label_rows=int(valid.sum()), fitted_signal_start=fitted.trade_date.min(),
+                            fitted_signal_end=fitted.trade_date.max(), latest_label_end=fitted.label_end_date.max())
+        fitting["train" if split == "train" else "valid"] = frame
+        del rows, frame
 
-    model, curve = fit_lightgbm(datasets, settings["lightgbm_params"], settings["training_control"])
-    best = model.best_iteration
-    model.save_model(str(out / "lightgbm.txt"), num_iteration=best)
+    dataset = make_dataset(**fitting)
+    fitting.clear()
+    model, curve, rank_metrics = fit_lightgbm(
+        dataset, settings["lightgbm_params"], settings["training_control"], title=f'滚动 LightGBM 窗口 {window["window"]}',
+    )
+    del dataset
+    best = model.model.best_iteration
+    model.model.save_model(str(out / "lightgbm.txt"), num_iteration=best)
     test = read_window(features, bounds["test"], dates, config)
-    x = test[names]
-    if np.isinf(x.to_numpy(dtype=np.float32)).any():
+    if np.isinf(test[names].to_numpy(dtype=np.float32)).any():
         raise ValueError("Infinite test features")
-    score = model.predict(x, num_iteration=best, num_threads=settings["lightgbm_params"]["num_threads"])
-    if not np.isfinite(score).all():
-        raise ValueError("Nonfinite rolling predictions")
     test_end = pd.Timestamp(config["segments"]["test"][1])
+    evaluable = test.label_end_date.le(test_end) & np.isfinite(test.label)
+    record_test_signal(model, test, names, evaluable)
     predictions = test.drop(columns=names).assign(
-        split="test", window=window["window"], rolling_lightgbm=score,
-        evaluable=test.label_end_date.le(test_end) & np.isfinite(test.label),
+        split="test", window=window["window"], evaluable=evaluable,
     ).sort_values(["trade_date", "ticker"]).reset_index(drop=True)
-    log = dict(**window, lightgbm_params=settings["lightgbm_params"], training_control=settings["training_control"],
-               training_label="daily_sample_zscore", best_iteration=best, trained_rounds=len(curve),
+    log = dict(**window, **rank_metrics, lightgbm_params=settings["lightgbm_params"], training_control=settings["training_control"],
+               training_label=settings["training_label"], best_iteration=best, trained_rounds=len(curve),
                train_mse=curve.iloc[best-1].train_mse, validation_mse=curve.iloc[best-1].validation_mse,
                fit_audit=audit, test_rows=len(predictions), test_labeled_rows=int(predictions.evaluable.sum()),
                fitted_preprocessors=[])
@@ -187,9 +182,7 @@ def train_rolling(config: dict, dates: pd.DatetimeIndex, out: Path) -> pd.DataFr
     from qlib.workflow.task.collect import RecorderCollector
 
     features = out / "features.parquet"
-    names = [item["name"] for item in json.loads((out / "alpha158.json").read_text())]
-    if len(names) != 158 or len(set(names)) != 158 or config["training_label"] != "daily_sample_zscore":
-        raise ValueError("Expected the existing Alpha158 and daily label standardization")
+    names = alpha158_columns(out)
     models = out / "models"
     with TemporaryDirectory(prefix="qlib-window-") as work:
         init_rolling_qlib(dates, config["qlib_version"], Path(work))
@@ -205,8 +198,6 @@ def train_rolling(config: dict, dates: pd.DatetimeIndex, out: Path) -> pd.DataFr
                 pred, curve = fit_window(task, config, dates, features, names, folder)
                 chunks.append(pred)
                 curves.append(curve.assign(strategy=ROLLING_SCORE, window=task["window"]))
-                indexed = pred.rename(columns={"trade_date": "datetime", "ticker": "instrument"})
-                recorder.save_objects(**{"pred.pkl": indexed.set_index(["datetime", "instrument"])})
                 recorder.log_params(window=task["window"])
             return recorder
 
@@ -216,11 +207,15 @@ def train_rolling(config: dict, dates: pd.DatetimeIndex, out: Path) -> pd.DataFr
         expected = pd.read_parquet(features, columns=["trade_date", "ticker"],
                                    filters=[("trade_date", ">=", windows[0]["effective"]["test"][0]),
                                             ("trade_date", "<=", windows[-1]["effective"]["test"][1])])
-        check_prediction_windows(pd.concat(chunks, ignore_index=True), windows, expected)
         collector = RecorderCollector(lambda: recorders, process_list=[RollingGroup()],
                                        rec_key_func=lambda rec: ("lightgbm", keys_by_record[rec.id]))
-        merged = collector()["pred"][("lightgbm",)].reset_index().rename(
-            columns={"datetime": "trade_date", "instrument": "ticker"})
+        scores = collector()["pred"][("lightgbm",)].reset_index().rename(
+            columns={"datetime": "trade_date", "instrument": "ticker", "score": ROLLING_SCORE})
+        merged = pd.concat(chunks, ignore_index=True).merge(
+            scores, on=["trade_date", "ticker"], how="outer", validate="one_to_one",
+        )
+        if not np.isfinite(merged[ROLLING_SCORE]).all() or merged.window.isna().any():
+            raise ValueError("Missing or nonfinite Qlib rolling predictions")
         check_prediction_windows(merged, windows, expected)
     curve_path = out / "training_mse.csv"
     if curve_path.is_file():
@@ -233,3 +228,24 @@ def train_rolling(config: dict, dates: pd.DatetimeIndex, out: Path) -> pd.DataFr
                  config=config)
     (out / "windows.json").write_text(json.dumps(specs, default=str, indent=2) + "\n")
     return merged
+
+
+def study_windows(config: dict, out: Path, predictions: pd.DataFrame) -> list[dict]:
+    """核对存档预测的训练设置、滚动窗口与测试期覆盖。"""
+    if ROLLING_SCORE not in predictions:
+        raise ValueError("实验缺少滚动模型预测，请用 run_all 完整运行")
+    specs = json.loads((out / "windows.json").read_text())
+    saved = specs["config"]
+    saved.setdefault("ridge_loss", RIDGE_LOSS)
+    saved["training_label"] = normalize_training_label(saved["training_label"])
+    # layers 和 main_offset 是旧实验的回测展示参数，可在复用预测时省略。
+    evaluation_keys = {"layers", "min_regression_pairs", "topk", "n_drop", "rebalance_days", "main_offset",
+                       "buy_price", "buy_fee_bps", "sell_fee_bps", "initial_capital_cny", "limit_threshold",
+                       "trade_unit", "min_trade_cost_cny", "lightgbm_tuning", "log_evaluation_period"}
+    if any(config.get(key) != saved.get(key) for key in (config.keys() | saved.keys()) - evaluation_keys):
+        raise ValueError("配置与存档的滚动训练不匹配")
+    test = predictions.loc[predictions.split.eq("test")]
+    if not np.isfinite(test[ROLLING_SCORE]).all() or test.window.isna().any():
+        raise ValueError("滚动模型缺少测试期分数或窗口编号")
+    check_prediction_windows(test, specs["windows"], test)
+    return specs["windows"]

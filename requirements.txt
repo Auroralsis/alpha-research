@@ -1,7 +1,12 @@
 # Python 3.10，适用于完整的中证500研究流程。
 pyqlib==0.9.7
+# Qlib 策略和执行器模块的导入依赖。
+cvxpy==1.7.5
+gym==0.26.2
+loguru==0.8.0
 mlflow==2.22.0
 lightgbm==4.6.0
+optuna==4.6.0
 numpy==2.2.6
 pandas==2.2.3
 scipy==1.15.3
@@ -22,3 +27,4 @@ psutil==7.2.2
 tqdm==4.70.1
 pymongo==4.13.2
 fire==0.7.1
+tushare==1.4.29
