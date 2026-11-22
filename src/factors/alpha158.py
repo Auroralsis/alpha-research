@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import pandas as pd
 
 from src.data.qlib_provider import qlib_bars, register_provider, write_provider
@@ -60,3 +61,44 @@ def alpha158_batches(panel: ResearchPanel, keys: pd.DataFrame, config: dict, wor
             values = native_features(symbols, spec, start_date, end_date)
             yield keys.loc[keys.ticker.isin(symbols)].merge(
                 values, on=["ticker", "trade_date"], how="left", validate="one_to_one")
+
+
+def factor_directions(train: pd.DataFrame, names: list[str]) -> pd.DataFrame:
+    """输入已剔除越界及无效收益的训练股票日，按各因子有效截面计算日 Spearman 相关。"""
+    daily = []
+    for day, group in train.groupby("trade_date", sort=True):
+        x = group[names]
+        mask = x.notna().to_numpy().T
+        patterns, classes = np.unique(np.packbits(mask, axis=1), axis=0, return_inverse=True)
+        correlations = pd.Series(np.nan, index=names, name=day)
+        for i in range(len(patterns)):
+            cols = np.flatnonzero(classes == i)
+            valid = mask[cols[0]]
+            if valid.sum() < 2:
+                continue
+            ranks = x.iloc[valid, cols].rank()
+            label_rank = group.loc[valid, "label"].rank()
+            correlations.loc[ranks.columns] = ranks.corrwith(label_rank)
+        daily.append(correlations)
+    history = pd.DataFrame(daily)
+    yearly = history.groupby(history.index.year).mean()
+    mean = history.mean()
+    direction = np.sign(mean)
+    same_years = np.sign(yearly).eq(direction, axis="columns").sum()
+    use = direction.notna() & direction.ne(0) & same_years.gt(len(yearly) / 2)
+    table = pd.DataFrame(dict(train_rank_ic=mean, valid_days=history.count(), same_sign_years=same_years,
+                              direction=direction.where(use, 0).astype(int)))
+    # 只合并同公式的滚动窗口；KMID2、OPEN0 等即时特征各为独立公式。
+    table["family"] = table.index.str.replace(r"(?:10|20|30|60|5)$", "", regex=True)
+    return table.join(yearly.T.add_prefix("rank_ic_")).rename_axis("factor")
+
+
+def equal_weight_scores(frame: pd.DataFrame, directions: pd.DataFrame) -> pd.Series:
+    """同日按方向排序，各家族先平均可用窗口，再平均可用家族。"""
+    used = directions.loc[directions.direction.ne(0)]
+    if used.empty:
+        raise ValueError("训练期没有方向可用的因子")
+    values = frame[used.index].mul(used.direction)
+    ranks = values.groupby(frame.trade_date).rank(method="average", pct=True)
+    family_scores = {family: ranks[rows.index].mean(axis=1) for family, rows in used.groupby("family")}
+    return pd.DataFrame(family_scores).mean(axis=1).rename("equal_weight")

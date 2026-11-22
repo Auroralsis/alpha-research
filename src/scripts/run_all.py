@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import CONFIG_FILE, load_config, rebalance_frequency
+from src.config import CONFIG_FILE, load_config, load_tuning, rebalance_frequency, validate_lightgbm_grid
 from src.data.download import save_parquet
 from src.data.research_panel import (
     CSI500_INPUTS as INPUTS, ROOT, ResearchPanel, load_market_calendar, prepare_inputs,
@@ -18,15 +18,16 @@ from src.factors.neutralization import attach_neutral_scores
 from src.factors.price_volume import SINGLE_FACTOR_SCORES
 
 RUNS = ROOT / "results/ml_study"
+FACTOR_RUNS = ROOT / "results/factors"
 
 
-def new_run(rebalance_days: int | None = None, *, tag: str = "") -> Path:
+def new_run(rebalance_days: int | None = None, *, tag: str = "", root: Path = RUNS) -> Path:
     """按调仓频率、实验类别和运行时间命名实验目录。"""
     parts = [rebalance_frequency(rebalance_days)[0]] if rebalance_days is not None else []
     if tag:
         parts.append(tag)
     parts.append(f"{datetime.now():%Y%m%d_%H%M%S_%f}")
-    return RUNS / "_".join(parts)
+    return root / "_".join(parts)
 
 
 def latest_run(*required: str, rebalance_days: int) -> Path:
@@ -71,13 +72,19 @@ def evaluate_predictions(config: dict, config_path: Path, out: Path, dates: pd.D
         used = ["calendar", "membership", "prices", "benchmark"]
         if config.get("limit_threshold") is None:
             used.append("limits")
+        if config.get("alpha158_processing") == "neutral":
+            used.extend(["caps", "industries"])
         inputs = {name: INPUTS[name] for name in used}
     else:
         from src.ml.rolling import study_windows
 
         windows = study_windows(config, out, predictions)
         strategies = (MODEL_SCORES[0], ROLLING_SCORE, MODEL_SCORES[1], *SINGLE_FACTOR_SCORES)
-        validation = MODEL_SCORES
+        if "lightgbm" not in predictions and (out / "manifest.json").is_file():
+            archive = json.loads((out / "manifest.json").read_text())
+            if "lightgbm" in archive.get("excluded_from_archive", []):
+                strategies = tuple(name for name in strategies if name != "lightgbm")
+        validation = tuple(name for name in MODEL_SCORES if name in strategies)
         scores, controls = prepare_test_scores(predictions, panel, test_dates, config)
         inputs = INPUTS
         common = common_scores(scores.loc[scores.split.eq("test")], strategies)
@@ -94,7 +101,7 @@ def evaluate_predictions(config: dict, config_path: Path, out: Path, dates: pd.D
     return write_results(config, config_path, inputs, out, ROOT, strategies)
 
 
-def main(*, lightgbm_only: bool = False) -> None:
+def main(argv=None, *, lightgbm_only: bool = False) -> None:
     """执行完整实验、验证集调参或复用预测刷新报告。"""
     parser = argparse.ArgumentParser(description="固定 LightGBM 与中证500指数比较" if lightgbm_only else __doc__)
     parser.add_argument("--config", type=Path)
@@ -103,11 +110,14 @@ def main(*, lightgbm_only: bool = False) -> None:
     if lightgbm_only:
         parser.set_defaults(stage="all")
     else:
+        parser.add_argument("--tuning-config", type=Path, help="仅用于 --stage tune，默认 configs/tuning.json")
         parser.add_argument("--stage", choices=("all", "evaluate", "tune"), default="all",
                             help="tune 用验证集调参，evaluate 使用已有预测刷新比较")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     evaluate = args.stage == "evaluate"
     tuning = args.stage == "tune"
+    if not lightgbm_only and args.tuning_config and not tuning:
+        parser.error("--tuning-config 需要 --stage tune")
     out = Path(args.out) if args.out else None
     if evaluate and out is None:
         days = load_config(args.config or CONFIG_FILE)["rebalance_days"]
@@ -131,13 +141,17 @@ def main(*, lightgbm_only: bool = False) -> None:
         if tuning:
             from src.ml.tuning import tune_lightgbm
 
-            if "lightgbm_tuning" not in config:
-                parser.error("请在研究配置中添加 lightgbm_tuning")
+            config["lightgbm_tuning"] = load_tuning("lightgbm_tuning", config, args.tuning_config)
+            validate_lightgbm_grid(config["lightgbm_tuning"], config["lightgbm"])
         out.mkdir(parents=True, exist_ok=True)
         if any(out.iterdir()):
             parser.error("新实验需要空目录，请选择其他 --out")
         print(f"本次实验目录 {out}", flush=True)
-        dates = prepare_inputs(config, need_industry=not (tuning or lightgbm_only))
+        neutral = config.get("alpha158_processing") == "neutral"
+        dates = prepare_inputs(config, need_industry=neutral or not (tuning or lightgbm_only))
+        if neutral:
+            from src.data.download import download_caps
+            download_caps(config)
         workers = args.workers if args.workers is not None else config.get("feature_workers", 6)
         through = config["segments"]["validation"][1] if tuning else None
         from src.ml.dataset import prepare_features
@@ -163,6 +177,11 @@ def main(*, lightgbm_only: bool = False) -> None:
         (out / "features.parquet").unlink()
     print(f"结果已生成 {out}")
     print(f"报告已生成 {report}")
+
+
+def lightgbm_main(argv=None):
+    """单独训练固定 LightGBM，评价与报告共用综合研究流程。"""
+    main(argv, lightgbm_only=True)
 
 
 if __name__ == "__main__":

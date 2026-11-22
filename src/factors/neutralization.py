@@ -99,3 +99,40 @@ def align_industry_history(keys: pd.DataFrame, history: pd.DataFrame) -> pd.Seri
     unique = distinct[distinct["nunique"].eq(1)]
     output.loc[unique.index] = unique["first"].astype("string")
     return output
+
+
+def clip_mad_columns(values: np.ndarray) -> np.ndarray:
+    """对一个交易日的 [股票 × 因子] 矩阵逐列做 5 MAD 截尾，保留缺失和零 MAD 列。"""
+    result = values.astype(float, copy=True)
+    available = ~np.isnan(result).all(axis=0)
+    block = result[:, available]
+    if block.size:
+        median_fn = np.nanmedian if np.isnan(block).any() else np.median
+        median = median_fn(block, axis=0)
+        mad = median_fn(np.abs(block - median), axis=0)
+        width = np.where(mad > 0, 5 * mad, np.inf)
+        result[:, available] = np.clip(block, median - width, median + width)
+    return result
+
+
+def neutral_feature_matrix(values: np.ndarray, caps: np.ndarray, industries: np.ndarray) -> np.ndarray:
+    """一个交易日的 [股票 × 因子] 矩阵；有效股票相同的列共用行业、市值回归。"""
+    result = np.full(values.shape, np.nan, dtype=np.float32)
+    has_controls = np.isfinite(caps) & (caps > 0) & pd.notna(industries)
+    valid = np.isfinite(values) & has_controls[:, None]
+    masks, classes = np.unique(np.packbits(valid.T, axis=1), axis=0, return_inverse=True)
+    for group in range(len(masks)):
+        cols = np.flatnonzero(classes == group)
+        rows = np.flatnonzero(valid[:, cols[0]])
+        if len(rows) < 3:
+            continue
+        industry = pd.get_dummies(industries[rows], dtype=float).to_numpy()
+        log_cap = mad_clip(np.log(caps[rows])).to_numpy()
+        design = np.column_stack([industry, log_cap])
+        if len(rows) <= design.shape[1] or np.linalg.matrix_rank(design) < design.shape[1]:
+            continue
+        clipped = clip_mad_columns(values[np.ix_(rows, cols)])
+        residuals = clipped - design @ np.linalg.lstsq(design, clipped, rcond=None)[0]
+        sd = residuals.std(axis=0, ddof=1)
+        result[np.ix_(rows, cols)] = (residuals - residuals.mean(axis=0)) / np.where(sd > 1e-12, sd, np.nan)
+    return result

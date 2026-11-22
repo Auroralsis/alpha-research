@@ -1,0 +1,33 @@
+{
+  "lightgbm_tuning": {
+    "search_space": {
+      "colsample_bytree": [0.5, 0.7],
+      "subsample": [1.0, 0.8]
+    }
+  },
+  "xgboost_tuning": {
+    "search_space": {
+      "max_depth": [3, 5],
+      "min_child_weight": [1, 10]
+    }
+  },
+  "rank_pair_tuning": {
+    "stages": ["depth", "leaves", "min_child", "l1", "l2", "row_sampling", "column_sampling"],
+    "depth": [3, 5, 7],
+    "leaf_cap_fractions": [0.5],
+    "min_data_in_leaf": [40, 240],
+    "min_child_weight": [3, 30],
+    "l1": [1, 30],
+    "l2": [30, 200],
+    "row_sampling": [0.65, 1.0],
+    "column_sampling": [0.35, 0.7]
+  },
+  "catboost_tuning": {
+    "search_space": {
+      "l2_leaf_reg": [100, 300, 1000]
+    }
+  },
+  "ridge_strong_alphas": [10000, 100000, 1000000, 10000000, 100000000],
+  "multiclass_pair_blend": {"weight_step_percent": 2},
+  "lambdarank_bottom_gaps": [1, 3, 5]
+}

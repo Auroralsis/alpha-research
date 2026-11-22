@@ -149,28 +149,60 @@ def download_prices() -> None:
     print(f"行情已保存到 {CSI500_INPUTS['prices']}")
 
 
+def tushare_query(api: str, fields: str = "", **params) -> pd.DataFrame:
+    """通过 TuShare 官方 HTTPS 接口读取一批数据。"""
+    response = requests.post("https://api.tushare.pro", timeout=30,
+                             json={"api_name": api, "token": os.environ["TUSHARE_TOKEN"], "params": params, "fields": fields})
+    response.raise_for_status()
+    result = response.json()
+    if result["code"] != 0:
+        raise ValueError(f"TuShare {api} 请求失败，错误码 {result['code']}")
+    time.sleep(DATA_SETTINGS["request_interval"])
+    return pd.DataFrame(result["data"]["items"], columns=result["data"]["fields"])
+
+
+def download_caps(config: dict | None = None) -> None:
+    """按历史成员的实际成交日补齐每日总市值和流通市值，按股票缓存响应。"""
+    dest = CSI500_INPUTS["caps"]
+    columns = ["ts_code", "trade_date", "total_mv", "circ_mv"]
+    existing = pd.read_parquet(dest) if dest.exists() else pd.DataFrame(columns=columns)
+    members = pd.read_parquet(CSI500_INPUTS["membership"], columns=["ticker", "trade_date"])
+    prices = pd.read_parquet(CSI500_INPUTS["prices"], columns=["ticker", "trade_date", "vol"])
+    members["trade_date"] = pd.to_datetime(members.trade_date.astype(str)).dt.strftime("%Y%m%d")
+    prices["trade_date"] = pd.to_datetime(prices.trade_date.astype(str)).dt.strftime("%Y%m%d")
+    keys = members.merge(prices.loc[prices.vol.gt(0)], on=["trade_date", "ticker"]).rename(columns={"ticker": "ts_code"})
+    segments = (config or load_config())["segments"]
+    start, end = segments["train"][0], segments["test"][1]
+    keys = keys.loc[keys.trade_date.between(start.replace("-", ""), end.replace("-", "")), columns[:2]]
+    existing["trade_date"] = existing.trade_date.astype(str)
+    missing = keys.merge(existing.loc[existing.total_mv.gt(0), columns[:2]], how="left", indicator=True)
+    groups = missing.loc[missing._merge.eq("left_only")].groupby("ts_code")
+    parts = []
+    for ticker, group in tqdm(groups, desc="补齐历史市值"):
+        begin, end = group.trade_date.min(), group.trade_date.max()
+        cache = ROOT / "data/raw/daily_basic" / f"{ticker}_{begin}_{end}.parquet"
+        if cache.exists():
+            frame = pd.read_parquet(cache)
+        else:
+            frame = tushare_query("daily_basic", fields=",".join(columns), ts_code=ticker, start_date=begin, end_date=end)
+            if frame.empty or not frame.ts_code.eq(ticker).all() or frame.duplicated(columns[:2]).any():
+                raise ValueError(f"{ticker} 历史市值响应为空或股票日期键无效")
+            save_parquet(frame, cache)
+        parts.append(group[columns[:2]].merge(frame, on=columns[:2], validate="one_to_one"))
+    if parts:
+        combined = pd.concat([existing, *parts], ignore_index=True).drop_duplicates(columns[:2], keep="last")
+        save_parquet(combined, dest)
+
+
 def fetch_tushare() -> pd.DataFrame:
     """按一级行业下载当前与历史记录，保留原始响应中的分类和生效区间。"""
-    token = os.environ["TUSHARE_TOKEN"]
-
-    def query(api: str, **params) -> pd.DataFrame:
-        response = requests.post("https://api.tushare.pro", timeout=30,
-                                 json={"api_name": api, "token": token, "params": params, "fields": ""})
-        response.raise_for_status()
-        result = response.json()
-        if result["code"] != 0:
-            raise ValueError(f"TuShare {api} 请求失败，错误码 {result['code']}")
-        time.sleep(DATA_SETTINGS["request_interval"])
-        data = result["data"]
-        return pd.DataFrame(data["items"], columns=data["fields"])
-
-    classes = query("index_classify", level="L1", src="SW2021")
+    classes = tushare_query("index_classify", level="L1", src="SW2021")
     if classes.empty or classes.index_code.duplicated().any():
         raise ValueError("申万一级行业目录为空或重复")
     frames = []
     for code in classes.index_code:
         for flag in ("Y", "N"):
-            frame = query("index_member_all", l1_code=code, is_new=flag)
+            frame = tushare_query("index_member_all", l1_code=code, is_new=flag)
             if len(frame) >= 2000 or (flag == "Y" and frame.empty):
                 raise ValueError(f"{code}/{flag} 返回空的当前成分或达到接口上限，请核查")
             if not frame.l1_code.eq(code).all() or not frame.is_new.eq(flag).all():
@@ -287,9 +319,12 @@ def main(argv: list[str] | None = None) -> None:
     steps = {"calendar": download_calendar, "membership": rebuild_membership,
              "prices": download_prices, "industry": download_industry}
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("part", nargs="?", default="all", choices=["all", *steps],
+    parser.add_argument("part", nargs="?", default="all", choices=["all", *steps, "caps"],
                         help="默认全部。calendar 含成分快照，membership 重建逐日成员表，prices 含复权因子。")
     part = parser.parse_args(argv).part
+    if part == "caps":
+        download_caps()
+        return
     for name, run in steps.items():
         if part in ("all", name):
             run()

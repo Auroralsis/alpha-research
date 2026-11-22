@@ -30,7 +30,7 @@
 
 取绝对值衡量关联强度，在各因子处理前后都有效的股票日上，158 项中有 31 项的 |Rank IC|、55 项的 |IC|、131 项的 |Rank ICIR|、113 项的 |ICIR| 上升。负的 Rank IC 表示因子值较低的股票随后收益排名倾向于更高。
 
-![因子处理前后 Rank IC 的对照](../../results/ml_study/daily_alpha158_neutral_20261121_0954/rank_ic_comparison.svg)
+![因子处理前后 Rank IC 的对照](../../results/factors/daily_alpha158_neutral_20261121_0954/rank_ic_comparison.svg)
 
 **图 1　每个点代表一个因子。** 横轴为原始 Rank IC，纵轴为处理后 Rank IC，两轴用该因子相同的有效股票日。虚线上的点表示数值相等。落在虚线上方表示数值变大。对本来为负的因子，应结合它离零的距离判断反向关联强弱。
 
@@ -44,7 +44,7 @@ IC 是每天因子与标签的 Pearson 相关系数的算术平均，Rank IC 是
 
 逐因子核对，3 项出现有效配对数变化。例如 2024-09-30 的 499 只有效股票，RANK5 原值全部等于 1，当天无法排序。处理后该列当天均为 NaN，两个版本的当日相关系数都无定义。原始结果与此前单因子报告独立对账，2023-07-14 的原始和处理后因子值与单日演示逐股核对。此处按同一测试期选出榜首，排名描述样本期关联，不衡量扣费组合收益。
 
-[158 项完整四指标对照与有效样本数](../../results/ml_study/daily_alpha158_neutral_20261121_0954/comparison.csv) · [逐日 IC、Rank IC 和配对数](../../results/ml_study/daily_alpha158_neutral_20261121_0954/daily_ic.parquet) · [原始因子样本与标签](../../results/ml_study/daily_alpha158_neutral_20261121_0954/alpha158_raw.parquet) · [处理后因子样本](../../results/ml_study/daily_alpha158_neutral_20261121_0954/alpha158_neutral.parquet)
+[158 项完整四指标对照与有效样本数](../../results/factors/daily_alpha158_neutral_20261121_0954/comparison.csv) · [逐日 IC、Rank IC 和配对数](../../results/factors/daily_alpha158_neutral_20261121_0954/daily_ic.parquet) · [原始因子样本与标签](../../results/factors/daily_alpha158_neutral_20261121_0954/alpha158_raw.parquet) · [处理后因子样本](../../results/factors/daily_alpha158_neutral_20261121_0954/alpha158_neutral.parquet)
 
 <details>
 <summary>展开全部 158 项，按处理后的 Rank IC 从高到低排列</summary>

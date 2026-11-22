@@ -8,7 +8,7 @@
 
 每天在股票截面上计算两种相关系数。IC 用 Pearson 相关，衡量因子数值和后续收益数值的线性关系。Rank IC 用 Spearman 相关，衡量两者的股票排名是否一致。表里的 IC 和 Rank IC 是各自的日均值。ICIR 和 Rank ICIR 分别用这个日均值除以对应的日样本标准差，采用 `ddof=1`，不年化。
 
-主榜比较 **158 列 Alpha158 原始特征和 Alpha3、Alpha13、Alpha44 的原始值**。主结果使用每个因子自己的有效股票日。共同样本复核使用 164 列信号均有值的 359,387 个股票日，占全部有标签样本的 99.24%。164 列包括三个传统因子的中性化版本。两种日相关系数均与本地 Qlib 0.9.7 的 `calc_ic()` 对照，榜单两端和三个传统因子的原始及中性化值覆盖全期，其余各列抽查 6 个交易日。 [口径和校验记录](../../results/ml_study/daily_factor_rank_ic_20261121_000219_058323/rank_ic_audit.json)
+主榜比较 **158 列 Alpha158 原始特征和 Alpha3、Alpha13、Alpha44 的原始值**。主结果使用每个因子自己的有效股票日。共同样本复核使用 164 列信号均有值的 359,387 个股票日，占全部有标签样本的 99.24%。164 列包括三个传统因子的中性化版本。两种日相关系数均与本地 Qlib 0.9.7 的 `calc_ic()` 对照，榜单两端和三个传统因子的原始及中性化值覆盖全期，其余各列抽查 6 个交易日。 [口径和校验记录](../../results/factors/daily_factor_rank_ic_20261121_000219_058323/rank_ic_audit.json)
 
 ## IC、ICIR 和 Rank ICIR 排名
 
@@ -55,7 +55,7 @@
 
 `KLEN` 为当日最高价减最低价，再除以开盘价。它是本次按 Rank IC 绝对值排名第一的指标。本样本里，振幅越大的股票，后续收益的相对排名倾向于更低。`STD5` 用最近五日收盘价的标准差除以当日收盘价，也呈现相同方向。
 
-![单因子日均 Rank IC 的正负两端](../../results/ml_study/daily_factor_rank_ic_20261121_000219_058323/factor_rank_ic_extremes.svg)
+![单因子日均 Rank IC 的正负两端](../../results/factors/daily_factor_rank_ic_20261121_000219_058323/factor_rank_ic_extremes.svg)
 
 **图 1　日均 Rank IC 的正负两端。** 每侧取七个因子。横条为各因子自己的有效样本结果，黑色菱形为同一批股票日上的结果。
 
@@ -74,4 +74,4 @@
 
 三种传统因子中性化后的 ICIR 和 Rank ICIR 都上升。中性化口径中，Alpha13 的 Rank ICIR 最高，为 +0.32166。Alpha44 的 ICIR 最高，为 +0.07206。
 
-[四项指标的完整排名、有效样本数和分年结果](../../results/ml_study/daily_factor_rank_ic_20261121_000219_058323/rank_ic_summary.csv) · [逐日 IC 与 Rank IC](../../results/ml_study/daily_factor_rank_ic_20261121_000219_058323/daily_rank_ic.csv) · [Alpha158 原始公式](../../results/ml_study/daily_factor_rank_ic_20261121_000219_058323/alpha158.json)
+[四项指标的完整排名、有效样本数和分年结果](../../results/factors/daily_factor_rank_ic_20261121_000219_058323/rank_ic_summary.csv) · [逐日 IC 与 Rank IC](../../results/factors/daily_factor_rank_ic_20261121_000219_058323/daily_rank_ic.csv) · [Alpha158 原始公式](../../results/factors/daily_factor_rank_ic_20261121_000219_058323/alpha158.json)

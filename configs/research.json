@@ -15,36 +15,115 @@
     ]
   },
   "feature_warmup_days": 60,
+  "alpha158_processing": "mad",
   "label_start_days": 1,
   "label_end_days": 2,
   "seed": 158,
   "training_label": "zscore",
   "ridge_loss": "mse",
   "ridge_alpha": 100.0,
-  "lightgbm": {
-    "objective": "regression",
-    "metric": "l2",
-    "learning_rate": 0.05,
-    "max_depth": 8,
-    "num_leaves": 31,
-    "colsample_bytree": 0.8879,
-    "subsample": 0.8789,
-    "lambda_l1": 300,
-    "lambda_l2": 580,
-    "num_threads": 16,
-    "verbosity": -1
+  "single_lightgbm": {
+    "description": "一个回归模型直接预测收益标签，固定模型和滚动窗口共用这些参数。",
+    "params": {
+      "objective": "regression",
+      "metric": "l2",
+      "learning_rate": 0.02554240953288225,
+      "max_depth": 5,
+      "num_leaves": 117,
+      "colsample_bytree": 0.5,
+      "subsample": 0.8,
+      "lambda_l1": 7.430068914643599,
+      "lambda_l2": 3.0313549368752515,
+      "num_threads": 16,
+      "verbosity": -1,
+      "min_data_in_leaf": 84,
+      "bagging_freq": 1
+    }
+  },
+  "listfold_mlp": {
+    "device": "cuda",
+    "hidden_sizes": [256, 512, 128, 32],
+    "learning_rate": 0.001,
+    "batch_days": 8,
+    "updates": 1000,
+    "evaluate_every": 100,
+    "cpu_threads": 16
+  },
+  "single_xgboost": {
+    "description": "固定使用 2022 年 LightGBM/XGBoost 等权组合验证损失最低时的 XGBoost 参数。A 选前 50、B 选前 100、C 避后 50、D 避后 100，四个排序器各训练一次。",
+    "params": {
+      "objective": "rank:ndcg",
+      "eval_metric": "ndcg@50",
+      "ndcg_exp_gain": false,
+      "lambdarank_pair_method": "topk",
+      "lambdarank_num_pair_per_sample": 53,
+      "tree_method": "hist",
+      "max_depth": 5,
+      "learning_rate": 0.02554240953288225,
+      "subsample": 0.8,
+      "colsample_bytree": 0.5,
+      "reg_alpha": 7.430068914643599,
+      "reg_lambda": 3.0313549368752515,
+      "min_child_weight": 10,
+      "nthread": 16
+    }
+  },
+  "four_model_targets": {
+    "top50": [0, 1, 2, 3, 9],
+    "top100": [0, 1, 2, 8, 9],
+    "avoid50": [0, 6, 7, 8, 9],
+    "avoid100": [0, 1, 7, 8, 9]
+  },
+  "four_model_weights": {"top50": 0.2, "top100": 0.2, "avoid50": 0.3, "avoid100": 0.3},
+  "six_grade_targets": {
+    "top50": [0, 2, 4, 6, 17, 19],
+    "top100": [0, 2, 4, 16, 17, 19],
+    "avoid50": [0, 12, 14, 16, 17, 19],
+    "avoid100": [0, 2, 14, 16, 17, 19]
+  },
+  "lightgbm_four_equal": {
+    "description": "四个 LambdaRank 模型共用以下参数，各自使用 four_model_targets 的一组增益。每天先转为排名百分位，再各占 25%。linear 只用作对照。",
+    "params": {
+      "objective": "lambdarank",
+      "metric": "ndcg",
+      "learning_rate": 0.02554240953288225,
+      "max_depth": 5,
+      "num_leaves": 117,
+      "colsample_bytree": 0.5,
+      "subsample": 0.8,
+      "lambda_l1": 7.430068914643599,
+      "lambda_l2": 3.0313549368752515,
+      "num_threads": 16,
+      "verbosity": -1,
+      "min_data_in_leaf": 84,
+      "bagging_freq": 1,
+      "eval_at": [50],
+      "lambdarank_truncation_level": 53
+    }
+  },
+  "xgboost_four_equal": {
+    "description": "用 single_xgboost.params 和 four_model_targets 训练四个模型，每天的排名百分位各占 25%。"
+  },
+  "lightgbm_xgboost_blend": {
+    "description": "混合两类四模型等权分数。XGBoost 占以下比例，剩余部分给 LightGBM。",
+    "xgboost_weight": 0.5
+  },
+  "single_catboost": {
+    "description": "A–D 分别训练一个按日分组的 CatBoost 排序器，直接使用四组真实增益。",
+    "params": {
+      "loss_function": "YetiRank:mode=NDCG;top=53;dcg_type=Base;dcg_denominator=LogPosition;permutations=1",
+      "eval_metric": "NDCG:top=50;type=Base;denominator=LogPosition",
+      "depth": 3, "learning_rate": 0.05, "l2_leaf_reg": 100,
+      "rsm": 0.5, "bootstrap_type": "Bernoulli", "subsample": 0.8,
+      "border_count": 64, "thread_count": 16, "task_type": "CPU"
+    }
+  },
+  "catboost_four_equal": {
+    "description": "四组排名各占 25%。用上一阶段选出的 LightGBM/XGBoost 组合为基线，再加入 CatBoost。",
+    "catboost_weight": 0.3333333333333333
   },
   "num_boost_round": 1000,
   "early_stopping_rounds": 50,
-  "lightgbm_tuning": {
-    "search_space": {
-      "max_depth": [8],
-      "lambda_l1": [250,300,350,400,450],
-      "lambda_l2": [250,300,350,400,450],
-      "num_leaves": [255],
-      "learning_rate": [0.1]
-    }
-  },
   "topk": 50,
   "n_drop": 5,
   "min_regression_pairs": 100,

@@ -1,6 +1,5 @@
 """使用 Optuna 网格搜索参数，并通过 Qlib 的 LightGBM API 训练。"""
 
-import json
 from math import prod
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,13 +9,14 @@ import optuna
 import pandas as pd
 from qlib.workflow import R
 
+from src.config import write_best_config
 from src.data.qlib_provider import register_provider
 from src.data.research_panel import segment_masks
 from src.ml.dataset import alpha158_columns, fitting_segment, make_dataset, read_feature_split
 from src.ml.models import fit_lightgbm, training_settings
 
 
-def tune_lightgbm(config: dict, out: Path) -> None:
+def tuning_dataset(config: dict, out: Path):
     """只读取训练和验证样本，复用现有标签筛选与早停逻辑。"""
     names = alpha158_columns(out)
     frames = {}
@@ -28,10 +28,21 @@ def tune_lightgbm(config: dict, out: Path) -> None:
             raise ValueError(f"Infinite Alpha158 inputs in {split}")
         frames[segment] = frame
     del rows, frame
-    dataset = make_dataset(**frames)
-    del frames
+    return make_dataset(**frames)
+
+
+def tune_lightgbm(config: dict, out: Path, *, candidate_models: Path | None = None) -> None:
+    """用验证集 MSE 选参；对照实验可指定临时目录保存各组最佳轮的模型。"""
     settings = training_settings(config)
     space = {key: list(dict.fromkeys(values)) for key, values in config["lightgbm_tuning"]["search_space"].items()}
+    params = settings["lightgbm_params"]
+    if "subsample" in space and min(space["subsample"]) < 1 and not params.get("bagging_freq", params.get("subsample_freq", 0)):
+        raise ValueError("搜索行采样率时，请在 lightgbm 中设置 bagging_freq 为正整数，例如 1")
+    for key, aliases in (("subsample", ("bagging_fraction", "sub_row", "bagging")),
+                         ("colsample_bytree", ("feature_fraction", "sub_feature"))):
+        if key in space and set(aliases).intersection(params):
+            raise ValueError(f"搜索 {key} 时，请只保留这个参数名，移除 lightgbm 中的同义参数")
+    dataset = tuning_dataset(config, out)
     grid_size = prod(map(len, space.values()))
     trials = []
     best_loss = float("inf")
@@ -53,6 +64,8 @@ def tune_lightgbm(config: dict, out: Path) -> None:
         loss = float(losses.validation_mse)
         if not np.isfinite(loss):
             raise ValueError("验证 MSE 不是有限数值")
+        if candidate_models is not None:
+            booster.save_model(str(candidate_models / f"{number}.txt"), num_iteration=best)
         search_params = {name: model_params[name] for name in space}
         trials.append(dict(trial=number, best_iteration=best, train_mse=float(losses.train_mse),
                            validation_mse=loss, **rank_metrics, **search_params))
@@ -73,4 +86,4 @@ def tune_lightgbm(config: dict, out: Path) -> None:
         study.optimize(evaluate, n_trials=grid_size)
     best = min(trials, key=lambda row: row["validation_mse"])
     best_config = dict(config, lightgbm={**config["lightgbm"], **{key: best[key] for key in space}})
-    (out / "best_config.json").write_text(json.dumps(best_config, indent=2) + "\n")
+    write_best_config(out, best_config)

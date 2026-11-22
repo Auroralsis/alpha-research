@@ -1,6 +1,6 @@
 GIT_COMMANDS.md
 PANDAS_DATAFRAME_GUIDE.md
-/AGENTS.md
+./AGENTS.md
 
 *.png
 __pycache__/

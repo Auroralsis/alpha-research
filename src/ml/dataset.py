@@ -1,7 +1,9 @@
 """把项目的股票日特征与收益接到 Qlib DatasetH。"""
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Sequence
 
 import numpy as np
@@ -36,7 +38,28 @@ def prepare_features(config: dict, dates: pd.DatetimeIndex, out: Path, workers: 
         panel_observation_status=panel.daily.observation_status.value_counts().to_dict(),
         price_keys_unique=True, member_keys_unique=True, snapshot_dates_at_or_before_signals=True,
     )
-    build_features(panel, members, config, out, workers, input_audit=input_audit)
+    if config.get("alpha158_processing", "raw") == "neutral":
+        with TemporaryDirectory(dir=out, prefix="raw-") as work:
+            raw_dir = Path(work)
+            build_features(panel, members, config, raw_dir, workers, input_audit=input_audit)
+            del daily, panel
+            prepare_neutral_features(config, raw_dir, out)
+    else:
+        build_features(panel, members, config, out, workers, input_audit=input_audit)
+
+
+def mad_feature_batches(path: Path, names: list[str]) -> Iterator[pd.DataFrame]:
+    """读入按股票分批生成的特征，按完整交易日截尾，按原行序写回。"""
+    from src.factors.neutralization import clip_mad_columns
+
+    frame = pd.read_parquet(path)
+    values = frame[names].to_numpy(dtype=np.float32, copy=True)
+    for positions in frame.groupby("trade_date", sort=False).indices.values():
+        values[positions] = clip_mad_columns(values[positions])
+    for start in range(0, len(frame), 40_000):
+        batch = frame.iloc[start:start + 40_000].copy()
+        batch[names] = values[start:start + len(batch)]
+        yield batch
 
 
 def build_features(panel: ResearchPanel, members: pd.DataFrame, config: dict, out: Path, workers: int,
@@ -62,9 +85,18 @@ def build_features(panel: ResearchPanel, members: pd.DataFrame, config: dict, ou
             block[names] = inputs
             yield block
 
-    write_parquet_batches(labeled_batches(), out / "features.parquet")
+    path = out / "features.parquet"
+    use_mad = config.get("alpha158_processing") == "mad"
+    if use_mad:
+        with TemporaryDirectory(dir=out) as work:
+            raw_path = Path(work) / path.name
+            write_parquet_batches(labeled_batches(), raw_path)
+            write_parquet_batches(mad_feature_batches(raw_path, names), path)
+    else:
+        write_parquet_batches(labeled_batches(), path)
     (out / "alpha158.json").write_text(json.dumps(spec, indent=2) + "\n")
     audit = {
+        "alpha158_processing": "mad" if use_mad else "raw",
         "members": len(members), "observed_panel_rows": len(bars), "feature_rows": len(keys),
         "valid_vwap_rows": int(bars.vwap_adj.notna().sum()), "feature_count": len(spec),
         "feature_infinities_stored_as_missing": {name: int(n) for name, n in zip(names, infinite_counts) if n},
@@ -132,3 +164,45 @@ def make_dataset(**frames: pd.DataFrame) -> DatasetH:
     """用完整股票日键保留各阶段的输入顺序，供 Qlib 拟合和预测。"""
     segments = {name: frame.index for name, frame in frames.items()}
     return DatasetH(handler=DataHandlerLP.from_df(pd.concat(frames.values())), segments=segments)
+
+
+def prepare_neutral_features(config: dict, raw_dir: Path, neutral_dir: Path) -> None:
+    """将各交易日的完整截面中性化，记录控制变量覆盖并写出有效股票日。"""
+    from threadpoolctl import threadpool_limits
+    from src.factors.neutralization import attach_controls, neutral_feature_matrix
+
+    neutral_dir.mkdir(exist_ok=True)
+    names = alpha158_columns(raw_dir)
+    raw = pd.read_parquet(raw_dir / "features.parquet", filters=[
+        ("trade_date", ">=", pd.Timestamp(config["segments"]["train"][0]))])
+    keys = ["trade_date", "ticker"]
+    caps = pd.read_parquet(INPUTS["caps"], columns=["trade_date", "ts_code", "total_mv"])
+    controls = attach_controls(raw[keys], caps, pd.read_parquet(INPUTS["industries"]))
+    if not controls[keys].equals(raw[keys]):
+        raise ValueError("市值、行业与原始特征的股票日未逐行对齐")
+    values = raw[names].to_numpy(dtype=np.float32)
+    outputs = np.empty_like(values)
+    cap, industry = controls.total_mv.to_numpy(), controls.industry.to_numpy()
+    with threadpool_limits(limits=1, user_api="blas"):
+        for day, positions in controls.groupby("trade_date").indices.items():
+            if not np.any(np.isfinite(cap[positions]) & (cap[positions] > 0) & pd.notna(industry[positions])):
+                raise ValueError(f"{day:%Y-%m-%d} 整个截面缺少控制变量，请补齐历史市值和行业")
+            outputs[positions] = neutral_feature_matrix(values[positions], cap[positions], industry[positions])
+    keep = np.isfinite(outputs).any(axis=1)
+    coverage = controls[keys].assign(stock_days=1, missing_cap=~(np.isfinite(cap) & (cap > 0)),
+                                     missing_industry=pd.isna(industry), retained=keep)
+    coverage.groupby("trade_date").sum(numeric_only=True).to_csv(neutral_dir / "control_coverage.csv")
+    if not coverage.groupby("trade_date").retained.any().all():
+        raise ValueError("部分交易日没有可用的中性化特征")
+    def batches(frame):
+        for start in range(0, len(frame), 40_000):
+            stop = start + 40_000
+            yield frame.iloc[start:stop].loc[keep[start:stop]]
+
+    audit = json.loads((raw_dir / "data_audit.json").read_text())
+    audit.update(alpha158_processing="neutral", retained_stock_days=int(keep.sum()),
+                 first_feature_date=str(raw.loc[keep, "trade_date"].min().date()))
+    (neutral_dir / "data_audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    raw[names] = outputs
+    write_parquet_batches(batches(raw), neutral_dir / "features.parquet")
+    (neutral_dir / "alpha158.json").write_bytes((raw_dir / "alpha158.json").read_bytes())

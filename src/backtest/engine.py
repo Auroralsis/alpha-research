@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 from src.data.qlib_provider import qlib_bars, register_provider, write_provider
-from src.data.research_panel import ResearchPanel, parse_dates
+from src.data.research_panel import CSI500_INPUTS, ResearchPanel, load_market_calendar, parse_dates, prepare_test_panel
+from src.backtest.factor_metrics import prediction_diagnostics
 from src.backtest.portfolio import load_benchmark_returns, performance
 
 
@@ -158,3 +159,14 @@ def run_backtests(
         "buy_price": buy_field, "limit_threshold": threshold,
         "min_trade_cost_cny": min_cost, "trade_unit": trade_unit, "benchmark_uses_pre_close": True,
     }, indent=2) + "\n")
+
+
+def evaluate_signals(scores: pd.DataFrame, config: dict, out: Path, methods: tuple[str, ...],
+                     *, portfolio_methods: tuple[str, ...] | None = None) -> pd.DatetimeIndex:
+    """在验证和测试期评价分数，仅用测试期分数回测，返回账本交易日。"""
+    calendar = load_market_calendar(CSI500_INPUTS["calendar"])
+    prediction_diagnostics(scores, config, calendar, out, strategies_by_split={"validation": methods, "test": methods})
+    panel, dates = prepare_test_panel(config, calendar)
+    run_backtests(CSI500_INPUTS, config, dates, scores.loc[scores.split.eq("test")], panel, out,
+                  strategies=methods if portfolio_methods is None else portfolio_methods)
+    return dates

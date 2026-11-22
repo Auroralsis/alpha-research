@@ -16,11 +16,11 @@ from qlib.workflow import R
 from qlib.workflow.record_temp import SignalRecord
 from scipy.stats import ConstantInputWarning
 
-from src.config import RIDGE_LOSS, ZSCORE_LABEL, normalize_training_label
+from src.config import RIDGE_LOSS, ZSCORE_LABEL, normalize_training_label, write_best_config
 from src.data.qlib_provider import register_provider
 from src.backtest.factor_metrics import daily_ic, ic_statistics
 from src.data.research_panel import segment_masks, stock_day_index
-from src.ml.dataset import alpha158_columns, fitting_segment, make_dataset, qlib_segment, read_feature_split
+from src.ml.dataset import alpha158_columns, fitting_targets, fitting_segment, make_dataset, qlib_segment, read_feature_split
 
 
 MODEL_SCORES = ("lightgbm", "ridge")
@@ -34,6 +34,7 @@ def training_settings(config: dict, *, include_ridge: bool = True) -> dict:
         controls["log_evaluation_period"] = config["log_evaluation_period"]
     settings = {
         "segments": config["segments"],
+        "alpha158_processing": config.get("alpha158_processing", "raw"),
         "training_label": normalize_training_label(config["training_label"]),
         "lightgbm_params": dict(config["lightgbm"], seed=config["seed"]),
         "training_control": controls,
@@ -86,6 +87,17 @@ def record_test_signal(model: LGBModel, frame: pd.DataFrame, names: list[str], e
         SignalRecord(model=model, dataset=dataset, recorder=R.get_recorder()).generate()
 
 
+def ridge_pipeline(config: dict, alpha: float):
+    """训练集拟合中位数填补、特征标准化及带截距的岭回归。"""
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(),
+                         Ridge(alpha=alpha, solver=config.get("ridge_solver", "cholesky")))
+
+
 def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) -> pd.DataFrame:
     """读取 out 中的 Alpha158 特征，保存模型与训练日志，返回验证和测试预测长表。
 
@@ -93,10 +105,6 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
     """
     import joblib
     import lightgbm as lgb
-    from sklearn.impute import SimpleImputer
-    from sklearn.linear_model import Ridge
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
     from threadpoolctl import threadpool_limits
 
     names = alpha158_columns(out)
@@ -104,10 +112,7 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
     params = settings["lightgbm_params"]
     controls = settings["training_control"]
     feature_audit, split_audit = [], {}
-    ridge = None
-    if include_ridge:
-        ridge = make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(),
-                              Ridge(alpha=config["ridge_alpha"], solver=config.get("ridge_solver", "cholesky")))
+    ridge = ridge_pipeline(config, config["ridge_alpha"]) if include_ridge else None
 
     def load(split: str) -> pd.DataFrame:
         """读取一个阶段的股票日特征，并记录缺失值与标签覆盖情况。"""
@@ -208,6 +213,7 @@ def load_predictions(config: dict, out: Path) -> pd.DataFrame:
     """读取当前批次的预测并确认训练参数匹配。"""
     log = json.loads((out / "training_log.json").read_text())
     log.setdefault("ridge_loss", RIDGE_LOSS)
+    log.setdefault("alpha158_processing", "raw")
     log["training_label"] = normalize_training_label(log.get("training_label", ZSCORE_LABEL))
     settings = training_settings(config)
     log.get("training_control", {}).pop("log_evaluation_period", None)
@@ -215,3 +221,62 @@ def load_predictions(config: dict, out: Path) -> pd.DataFrame:
     if any(log.get(key) != value for key, value in settings.items()):
         raise ValueError("Saved predictions use a different training configuration")
     return pd.read_parquet(out / "predictions.parquet")
+
+
+def compare_ridge(config: dict, cache: Path, out: Path) -> pd.DataFrame:
+    """用缓存的中性化特征比较 L2 惩罚，冻结验证 MSE 最低的强正则后再打分。"""
+    import joblib
+    from sklearn.base import clone
+    from sklearn.pipeline import Pipeline
+    from threadpoolctl import threadpool_limits
+
+    strong = config["ridge_strong_alphas"]
+    if not strong or not all(np.isfinite(a) and a > 0 for a in strong):
+        raise ValueError("ridge_strong_alphas 须为有限正数")
+    names = alpha158_columns(cache)
+    path = cache / "features.parquet"
+    segments = config["segments"]
+
+    def fitting_data(split):
+        rows = read_feature_split(path, segments[split], split)
+        eligible = rows.loc[segment_masks(rows, segments)[split]]
+        target = fitting_targets(eligible, config["training_label"])
+        rows = rows.loc[target.index]
+        return rows[names], target.set_axis(stock_day_index(rows))
+
+    prototype = ridge_pipeline(config, strong[0])
+    transform = prototype[:-1]
+    x, y = fitting_data("train")
+    x = transform.fit_transform(x)
+    v, z = fitting_data("validation")
+    v = transform.transform(v)
+    results, models = [], {}
+    with threadpool_limits(limits=config.get("ridge_num_threads", 4)):
+        for alpha in sorted(set(strong)):
+            ridge = clone(prototype[-1]).set_params(alpha=alpha).fit(x, y)
+            row = dict(alpha=alpha, coefficient_norm=float(np.linalg.norm(ridge.coef_)))
+            for split, features, target in (("train", x, y), ("validation", v, z)):
+                score = pd.Series(ridge.predict(features), index=target.index)
+                row[split + "_mse"] = ((score - target) ** 2).mean()
+                row[split + "_rank_ic"] = daily_ic(score, target)[1].mean()
+            results.append(row)
+            models[alpha] = Pipeline([*transform.steps, ("ridge", ridge)])
+            print(f"Ridge α={alpha:g} 训练 MSE={row['train_mse']:.7f} 验证 MSE={row['validation_mse']:.7f} "
+                  f"训练 Rank IC={row['train_rank_ic']:.5f} 验证 Rank IC={row['validation_rank_ic']:.5f}", flush=True)
+        del x, v
+        trials = pd.DataFrame(results).set_index("alpha")
+        if not np.isfinite(trials.validation_mse).all():
+            raise ValueError("Ridge 验证 MSE 无效")
+        best = trials.validation_mse.idxmin()
+        trials.to_csv(out / "ridge_trials.csv")
+        joblib.dump(models[best], out / "ridge.joblib")
+        write_best_config(out, dict(config, ridge_alpha=float(best)))
+        parts = []
+        for split in ("validation", "test"):
+            rows = read_feature_split(path, segments[split], split)
+            result = rows[["trade_date", "ticker", "label"]].copy()
+            features = transform.transform(rows[names])
+            result["ridge_strong"] = models[best][-1].predict(features)
+            result["evaluable"] = segment_masks(rows, segments)[split]
+            parts.append(result.assign(split=split))
+    return pd.concat(parts, ignore_index=True)

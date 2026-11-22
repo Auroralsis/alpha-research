@@ -47,11 +47,11 @@
 | Alpha96 | 0 | 0 | 0 | 0 |
 | Alpha97 | 330 | 1342 | 33 | 256 |
 
-旧版滚动计算在常数窗口内可能因浮点舍入产生微小波动。本次显式检查取值是否相同，Alpha3 有 2,042 个股票日、Alpha44 有 7 个股票日的相关系数改为缺失。常数窗口的协方差取零后，Alpha13 有 9,114 个股票日因并列排名调整了分数。这三项的新分数和修正后的原有计算入口逐股逐日相同。 [新旧覆盖核对](../../results/ml_study/daily_alpha101_20261121_100812_471952/constant_window_audit.csv)
+旧版滚动计算在常数窗口内可能因浮点舍入产生微小波动。本次显式检查取值是否相同，Alpha3 有 2,042 个股票日、Alpha44 有 7 个股票日的相关系数改为缺失。常数窗口的协方差取零后，Alpha13 有 9,114 个股票日因并列排名调整了分数。这三项的新分数和修正后的原有计算入口逐股逐日相同。 [新旧覆盖核对](../../results/factors/daily_alpha101_20261121_100812_471952/constant_window_audit.csv)
 
-Alpha96 要求两条分支同时有效。第二条分支的短窗相关有 132,997 个股票日可算，之后取 12 日极值位置剩 2,957 个，再做 14 日加权平均剩 52 个，最后做 13 日时序排名剩 0 个。 [逐层计数](../../results/ml_study/daily_alpha101_20261121_100812_471952/alpha96_coverage.csv)
+Alpha96 要求两条分支同时有效。第二条分支的短窗相关有 132,997 个股票日可算，之后取 12 日极值位置剩 2,957 个，再做 14 日加权平均剩 52 个，最后做 13 日时序排名剩 0 个。 [逐层计数](../../results/factors/daily_alpha101_20261121_100812_471952/alpha96_coverage.csv)
 
-[指标、有效样本数和四项绝对值排名](../../results/ml_study/daily_alpha101_20261121_100812_471952/factor_metrics.csv) · [逐日指标](../../results/ml_study/daily_alpha101_20261121_100812_471952/daily_ic.parquet) · [原始样本和标签](../../results/ml_study/daily_alpha101_20261121_100812_471952/alpha101_raw.parquet) · [中性化样本](../../results/ml_study/daily_alpha101_20261121_100812_471952/neutral.parquet)
+[指标、有效样本数和四项绝对值排名](../../results/factors/daily_alpha101_20261121_100812_471952/factor_metrics.csv) · [逐日指标](../../results/factors/daily_alpha101_20261121_100812_471952/daily_ic.parquet) · [原始样本和标签](../../results/factors/daily_alpha101_20261121_100812_471952/alpha101_raw.parquet) · [中性化样本](../../results/factors/daily_alpha101_20261121_100812_471952/neutral.parquet)
 
 **表 4　全部 101 项，按中性化 Rank ICIR 绝对值降序排列**
 

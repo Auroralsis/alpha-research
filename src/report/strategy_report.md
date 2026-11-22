@@ -18,11 +18,9 @@
 | 验证 | {validation_start} 至 {validation_end} | {valid[fitted_rows]:,} |
 | 测试 | {test_start} 至 {test_end} | {held_out[evaluable_rows]:,} |
 
-Alpha158 预测 T+{label_end} 相对 T+{label_start} 的复权收盘收益。固定 LightGBM 在第 {best} 轮取得最佳验证结果，训练 / 验证 MSE 为 {losses.train_mse:.6f} / {losses.validation_mse:.6f}。{ridge_losses} [训练日志]({links}/training_log.json)
+模型用{feature_mode}预测 T+{label_end} 相对 T+{label_start} 的复权收盘收益。{training_details}{ridge_losses} [训练日志]({links}/training_log.json)
 
-![训练与验证损失]({links}/training_mse.svg)
-
-**图 1　固定 LightGBM 训练与验证 MSE。** 横轴为提升轮数，纵轴使用{label_scale}计算，竖线标出验证集选出的轮数。
+{training_chart}
 
 ## 预测排序
 

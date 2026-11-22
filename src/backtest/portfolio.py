@@ -84,14 +84,15 @@ def performance(ledger: pd.DataFrame, benchmark_returns: pd.Series | None = None
 STRATEGIES = ("lightgbm", "rolling_lightgbm")
 
 
-def window_portfolio_returns(ledger: pd.DataFrame, windows: list[dict], rebalance_days: int) -> pd.DataFrame:
+def window_portfolio_returns(ledger: pd.DataFrame, windows: list[dict], rebalance_days: int,
+                             strategies: tuple[str, ...] = STRATEGIES) -> pd.DataFrame:
     """按测试窗口分别计算各偏移轨道的年化超额收益，再对轨道等权平均。"""
-    books = ledger.loc[ledger.strategy.isin(STRATEGIES)]
+    books = ledger.loc[ledger.strategy.isin(strategies)]
     rows = []
     for window in windows:
         begin, end = map(pd.Timestamp, window["effective"]["test"])
         segment = books.loc[books.trade_date.between(begin, end)].set_index("trade_date")
-        for strategy in STRATEGIES:
+        for strategy in strategies:
             tracks = segment.loc[segment.strategy.eq(strategy)].groupby("offset")
             if set(tracks.groups) != set(range(rebalance_days)):
                 raise ValueError("窗口缺少调仓偏移轨道或包含意外轨道")
@@ -118,7 +119,8 @@ def evaluate_windows(windows: list[dict], rebalance_days: int, dates: pd.Datetim
         window_dates = dates[(dates >= begin) & (dates <= end)]
         for strategy, group in daily_by_strategy:
             window_ic.append(dict(strategy=strategy, **summarize_ic(group.reindex(window_dates)), window=window["window"]))
-    returns = window_portfolio_returns(pd.read_parquet(out / "ledger.parquet"), windows, rebalance_days)
+    returns = window_portfolio_returns(pd.read_parquet(out / "ledger.parquet"), windows, rebalance_days,
+                                       tuple(name for name, _ in daily_by_strategy))
     summary = pd.DataFrame(window_ic).merge(returns, on=["window", "strategy"], validate="one_to_one")
     summary.to_csv(out / "window_rank_ic.csv", index=False)
 
