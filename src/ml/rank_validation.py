@@ -92,7 +92,7 @@ def validation_loss(frame, score, gains, k):
     if not score.index.equals(frame.index) or not np.isfinite(score.to_numpy()).all():
         raise ValueError("预测分数缺失或与股票日未对齐")
     valid = frame.loc[frame.evaluable, ["trade_date", "ticker", "grade"]].assign(score=score)
-    if valid.empty or valid.score.isna().any() or valid.grade.isna().any():
+    if valid.empty or valid.grade.isna().any():
         raise ValueError("验证损失需要对齐的预测与有效收益档位")
     valid = valid.sort_values(["trade_date", "score", "ticker"], ascending=[True, False, True])
     rows = []

@@ -15,7 +15,7 @@ import pandas as pd
 from src.config import load_config
 from src.data.download import merge_prices, write_parquet_batches
 from src.data.qlib_provider import qlib_bars, write_provider
-from src.data.research_panel import execution_labels, parse_dates, prepare_membership, prepare_panel, segment_masks
+from src.data.research_panel import ResearchPanel, execution_labels, parse_dates, prepare_membership, prepare_panel, segment_masks
 from src.data.universe_process import build_membership
 from src.factors.alpha101 import formula_values
 from src.factors.alpha158 import initialize_qlib, native_features
@@ -24,6 +24,58 @@ from src.factors.price_volume import (
     FACTORS, alpha3, alpha13, alpha44, choose, compute_factors, correlation, covariance, cross_sectional_rank,
     decay_linear, indneutralize, less, ts_argmax, ts_rank, window_correlation, window_covariance,
 )
+from src.scripts.industry_reversal import FACTOR, daily_results, freeze_groups, peer_statistics, reversal
+
+
+class IndustryReversalTests(unittest.TestCase):
+    def test_peers_exclude_self_and_use_only_same_day_members(self):
+        day = pd.Timestamp("2023-01-03")
+        rows = pd.DataFrame({
+            "trade_date": day, "ticker": list("ABCDEFGH"),
+            "industry": ["one"] * 5 + ["two", "none", pd.NA],
+            "member": [True] * 4 + [False, True, False, True],
+            "stock_return": [0.0, .01, .02, .03, .04, .05, .06, .07],
+        })
+        result = peer_statistics(rows).set_index("ticker")
+        self.assertEqual(result.peer_count.tolist(), [3, 3, 3, 3, 4, 0, 0, 0])
+        np.testing.assert_allclose(result.peer_median, [.02, .02, .01, .01, .015, np.nan, np.nan, np.nan])
+        self.assertTrue(result.loc[["F", "G", "H"], "relative_return"].isna().all())
+
+    def test_window_does_not_bridge_a_nontrading_day_or_use_future_prices(self):
+        dates = pd.bdate_range("2023-01-03", periods=8)
+        tickers = pd.Index(list("ABCDE"))
+        data = pd.MultiIndex.from_product([dates, tickers], names=["trade_date", "ticker"]).to_frame(index=False)
+        data["close_adj"] = 100.0
+        data.loc[data.ticker.eq("A"), "close_adj"] = 100 * .99 ** np.arange(len(dates))
+        data["observation_status"] = "observed"
+        data.loc[data.ticker.eq("A") & data.trade_date.eq(dates[6]), "observation_status"] = "no_trade"
+        members = data.loc[~(data.ticker.eq("A") & data.trade_date.eq(dates[1]))]
+        history = pd.DataFrame({"ts_code": tickers, "l1_code": "I", "in_date": "20200101", "out_date": None})
+        values, parts = reversal(ResearchPanel(data, dates, tickers), members, history)
+        results = values.loc[values.ticker.eq("A")]
+        self.assertEqual(results.trade_date.tolist(), [dates[5]])
+        self.assertAlmostEqual(results.iloc[0][FACTOR], .05)
+        example = parts.loc[parts.ticker.eq("A") & parts.trade_date.eq(dates[1])].iloc[0]
+        self.assertEqual(example.peer_count, 4)
+        data.loc[data.ticker.eq("A") & data.trade_date.gt(dates[5]), "close_adj"] *= 500
+        later, _ = reversal(ResearchPanel(data, dates, tickers), members, history)
+        pd.testing.assert_frame_equal(values, later)
+
+    def test_tied_factors_have_disjoint_tails_and_missing_label_does_not_replace_pick(self):
+        dates = pd.DatetimeIndex(["2023-01-03", "2023-01-04"])
+        frame = pd.DataFrame({"trade_date": dates[0], "ticker": [f"{i:03}" for i in range(50)],
+                              "baseline_rank": np.arange(51, 101), "band": "B", FACTOR: 0.0})
+        frame.loc[20:, FACTOR] = np.nan
+        picks, coverage = freeze_groups(frame.sample(frac=1, random_state=0), dates)
+        self.assertEqual(picks.ticker.tolist(), [f"{i:03}" for i in range(20)])
+        selected = picks.assign(label=0.0)
+        selected.loc[selected["ticker"].eq("000"), "label"] = np.nan
+        selected.loc[selected["side"].eq("L"), "label"] = .01
+        result = daily_results(coverage, selected, "band").query("band == 'B'")
+        self.assertEqual(result.n_label_H.tolist(), [9, 0])
+        self.assertFalse(result.full_labels.any())
+        self.assertAlmostEqual(result.spread.iloc[0], -.01)
+        self.assertTrue(pd.isna(result.spread.iloc[1]))
 
 
 class DataPreparationTests(unittest.TestCase):
@@ -554,6 +606,53 @@ class NeutralizationTests(unittest.TestCase):
         self.assertEqual(align_industry_history(keys,history).tolist(),["old","new","new"])
         history.loc[0,"out_date"]="20230215"
         self.assertTrue(pd.isna(align_industry_history(keys,history).iloc[1]))
+
+
+class PublishedFinancialFactorTests(unittest.TestCase):
+    def test_delayed_versions_and_quarter_end_equity(self):
+        from src.scripts.factor_extensions import financial_factor
+
+        quarters = pd.period_range("2015Q1", periods=18, freq="Q")
+        dates = pd.bdate_range("2015-01-01", "2020-01-01")
+        def records(field, values, kind):
+            rows = []
+            for period, value in zip(quarters, values):
+                end = period.end_time.normalize()
+                day = (end + pd.Timedelta(days=20)).strftime("%Y%m%d")
+                rows.append(dict(ticker="A", end_date=end.strftime("%Y%m%d"), f_ann_date=day, ann_date=day,
+                                 report_type=kind, **{field: value}))
+            return pd.DataFrame(rows)
+
+        eps = np.arange(len(quarters), dtype=float)**2
+        income = records("basic_eps", eps, "2").assign(n_income_attr_p=eps)
+        equity = records("total_hldr_eqy_exc_min_int", 100 + np.arange(len(quarters)), "1")
+        date = pd.Timestamp(income.iloc[-1].f_ann_date)
+        effective = dates[dates.searchsorted(date, side="right")]
+        update = income.iloc[[-1]].assign(report_type="3", f_ann_date="20190801", ann_date="20190801",
+                                          basic_eps=400, n_income_attr_p=400)
+        events = pd.concat([income, update], ignore_index=True)
+        streams = {"income": events, "equity": equity,
+                   "eps": events.drop(columns="f_ann_date").rename(columns={"basic_eps": "q_eps"})}
+        with patch("src.scripts.factor_extensions.cached", side_effect=streams.__getitem__):
+            sue = financial_factor("SUE", dates).xs("A", level="ticker")
+            roe = financial_factor("dROE", dates).xs("A", level="ticker")
+        prior = eps[9:17] - eps[5:13]
+        self.assertAlmostEqual(sue.at[effective], (eps[17]-eps[13]) / prior.std(ddof=1))
+        self.assertAlmostEqual(roe.at[effective],eps[17]/116-eps[13]/112)
+        self.assertAlmostEqual(roe.at[pd.Timestamp("20190801")],roe.at[effective])
+        self.assertAlmostEqual(roe.at[pd.Timestamp("20190802")],400/116-eps[13]/112)
+
+
+class FeatureSelectionTests(unittest.TestCase):
+    def test_daily_redundancy_uses_common_finite_ranks(self):
+        from src.scripts.feature_selection import day_correlations
+
+        x = np.arange(60, dtype=float)
+        rows = pd.DataFrame({"x": x, "reverse": -x, "ties": x // 5, "constant": 1.0,
+                             "sparse": np.where(x < 29, x, np.nan)})
+        rows.loc[::5, "ties"] = np.nan
+        expected = rows.rank(pct=True).corr(min_periods=30)
+        np.testing.assert_allclose(day_correlations(rows), expected, atol=1e-12, equal_nan=True)
 
 
 if __name__ == "__main__":

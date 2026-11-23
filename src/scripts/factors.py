@@ -8,7 +8,7 @@ import pandas as pd
 
 from src.backtest.engine import evaluate_signals
 from src.backtest.factor_metrics import evaluate_factors
-from src.config import CONFIG_FILE, load_config, load_tuning
+from src.config import walk_forward_policy, CONFIG_FILE, load_config, load_tuning
 from src.data.download import save_parquet, write_parquet_batches
 from src.data.research_panel import (
     CSI500_INPUTS, ROOT, execution_labels, load_market_calendar, prepare_membership,
@@ -149,6 +149,7 @@ def run_ranking(reference: Path, raw_test: Path) -> Path:
     original = Path(cfg["feature_source"])
     out = new_run(cfg["rebalance_days"], tag="alpha101_ranking")
     out.mkdir()
+    cfg["walk_forward"] = load_config()["walk_forward"]
     cfg.update(comparison_reference=str(reference), raw_alpha101_test=str(raw_test), additional_processing="daily_5mad")
     cfg["reference_xgboost_trial"] = cfg.pop("selected_trial", None)
     cfg["feature_sets"] = {"base": "Alpha158", "alpha101": "Alpha101", "combined": "Alpha158 + Alpha101"}
@@ -184,6 +185,21 @@ def train_and_compare(out: Path):
     for name in methods:
         loss = validation_loss(valid, valid[name], gains, cfg["topk"])
         metrics.append(dict(strategy=name, validation_loss=loss.loss.mean(), days=len(loss)))
+    if cfg.get("walk_forward", {}).get("early_stop_years"):
+        from src.ml.walk_forward import rank_losses
+
+        fold_rows = []
+        options = {f: [cfg[f]] for f in ("lightgbm", "xgboost")}
+        base = alpha158_columns(original)
+        for arm, names in (("base", base), ("alpha101", FACTORS), ("combined", base + FACTORS)):
+            table = rank_losses(out / arm, dict(cfg, feature_source=str(out)), options,
+                                cfg["lightgbm_xgboost_blend"]["xgboost_weight"], names=names)
+            fold_rows.append(table.assign(arm=arm))
+        detail = pd.concat(fold_rows)
+        detail.to_csv(out / "fold_trials.csv", index=False)
+        metrics = [dict(strategy=f"{arm}_{strategy}", validation_loss=group[column].mean(), days=group.days.sum())
+                   for arm, group in detail.groupby("arm")
+                   for strategy, column in zip(ENSEMBLES, ("baseline_loss", "model_loss", "blend_loss"))]
     pd.DataFrame(metrics).to_csv(out / "validation_loss.csv", index=False)
     evaluate_signals(predictions, cfg, out, methods)
     from src.report.rank_stack import write_feature_comparison
@@ -227,6 +243,7 @@ def equal_weight_main(argv=None) -> None:
     names = alpha158_columns(cache)
     if args.ridge:
         config.update({key: settings[key] for key in ("ridge_alpha", "ridge_solver", "ridge_num_threads")})
+        config["walk_forward"] = walk_forward_policy(settings)
         config["ridge_strong_alphas"] = load_tuning("ridge_strong_alphas", settings, args.tuning_config)
         config["alpha158_processing"] = "neutral"
     out = new_run(config["rebalance_days"], tag="ridge_comparison" if args.ridge else "equal_weight")

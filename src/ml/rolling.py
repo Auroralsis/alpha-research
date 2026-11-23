@@ -48,10 +48,7 @@ def rolling_windows(dates: pd.DatetimeIndex, config: dict, feature_start: pd.Tim
     target_dates = dates[(dates >= test_start) & (dates <= test_end)]
     if target_dates.empty or not first <= nominal["train"][1] < nominal["validation"][0] <= nominal["validation"][1] < test_start:
         raise ValueError("Rolling study requires nonempty and ordered train, validation and test segments")
-    window_count = config.get("rolling_test_windows", 3)
-    if not isinstance(window_count, int) or window_count <= 0:
-        raise ValueError("rolling_test_windows 必须是正整数")
-    step = ceil(len(target_dates) / window_count)
+    step = ceil(len(target_dates) / config.get("rolling_test_windows", 3))
     distance = config["label_end_days"] + 1
     template = {"dataset": {"kwargs": {"segments": segments}}}
     raw_generator = RollingGen(step=step, rtype=RollingGen.ROLL_SD, ds_extra_mod_func=None)
@@ -239,7 +236,7 @@ def study_windows(config: dict, out: Path, predictions: pd.DataFrame) -> list[di
     saved.setdefault("ridge_loss", RIDGE_LOSS)
     saved["training_label"] = normalize_training_label(saved["training_label"])
     # layers 和 main_offset 是旧实验的回测展示参数，可在复用预测时省略。
-    evaluation_keys = {"layers", "min_regression_pairs", "topk", "n_drop", "rebalance_days", "main_offset",
+    evaluation_keys = {"walk_forward", "layers", "min_regression_pairs", "topk", "n_drop", "rebalance_days", "main_offset",
                        "buy_price", "buy_fee_bps", "sell_fee_bps", "initial_capital_cny", "limit_threshold",
                        "single_catboost", "catboost_four_equal", "lightgbm_four_equal", "four_model_targets", "lightgbm_xgboost_blend",
                        "xgboost", "xgboost_tuning", "trade_unit", "min_trade_cost_cny", "lightgbm_tuning", "neutral_search",

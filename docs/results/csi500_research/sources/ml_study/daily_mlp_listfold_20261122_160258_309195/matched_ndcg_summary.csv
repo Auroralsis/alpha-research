@@ -1,0 +1,5 @@
+split,strategy,one_minus_ndcg,days
+test,listfold_exp,0.49147622429488735,725
+test,lambdarank_equal,0.49103224087984165,725
+validation,listfold_exp,0.49002222545482077,240
+validation,lambdarank_equal,0.4856646836915531,240

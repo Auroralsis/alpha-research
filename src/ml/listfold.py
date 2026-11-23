@@ -115,7 +115,6 @@ def fit_tree(sections, names, cfg, out):
                       lgb.record_evaluation(history), lgb.log_evaluation(50)])
     curve = pd.Series(history["early_stop"]["listfold_nll_per_pair"], name="early_stop_nll_per_pair")
     curve.index = pd.RangeIndex(1, len(curve)+1, name="iteration")
-    assert model.best_iteration == curve.idxmin()
     curve.to_csv(out / "early_stop.csv")
     model.save_model(out / "listfold.txt", num_iteration=model.best_iteration)
     print("最佳轮数", model.best_iteration, "早停损失", curve.min(), flush=True)

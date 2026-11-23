@@ -14,6 +14,7 @@
       "2025-12-31"
     ]
   },
+  "walk_forward": {"initial_train_years": 3, "early_stop_years": 1, "validation_years": 1},
   "feature_warmup_days": 60,
   "alpha158_processing": "mad",
   "label_start_days": 1,
@@ -107,6 +108,11 @@
   "lightgbm_xgboost_blend": {
     "description": "混合两类四模型等权分数。XGBoost 占以下比例，剩余部分给 LightGBM。",
     "xgboost_weight": 0.5
+  },
+  "catrank_regressor": {
+    "loss_function": "RMSE", "iterations": 300, "depth": 3, "learning_rate": 0.05,
+    "l2_leaf_reg": 100, "rsm": 0.5, "bootstrap_type": "Bernoulli", "subsample": 0.8,
+    "border_count": 64, "thread_count": 16, "task_type": "CPU"
   },
   "single_catboost": {
     "description": "A–D 分别训练一个按日分组的 CatBoost 排序器，直接使用四组真实增益。",

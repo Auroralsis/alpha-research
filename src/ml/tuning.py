@@ -42,7 +42,10 @@ def tune_lightgbm(config: dict, out: Path, *, candidate_models: Path | None = No
                          ("colsample_bytree", ("feature_fraction", "sub_feature"))):
         if key in space and set(aliases).intersection(params):
             raise ValueError(f"搜索 {key} 时，请只保留这个参数名，移除 lightgbm 中的同义参数")
-    dataset = tuning_dataset(config, out)
+    from src.ml.walk_forward import folds, regression_loss
+    windows = folds(config) if "walk_forward" in config else []
+    fold_results = []
+    dataset = None if windows else tuning_dataset(config, out)
     grid_size = prod(map(len, space.values()))
     trials = []
     best_loss = float("inf")
@@ -54,6 +57,22 @@ def tune_lightgbm(config: dict, out: Path, *, candidate_models: Path | None = No
         if trial is not None:
             model_params.update({key: trial.suggest_categorical(key, values) for key, values in space.items()})
         number = len(trials)
+        if windows:
+            losses = []
+            for window in windows:
+                loss, rounds = regression_loss(out, config, window, model_params)
+                if not np.isfinite(loss):
+                    raise ValueError("逐折验证 MSE 不是有限数值")
+                losses.append(loss)
+                fold_results.append(dict(trial=number, train_start=window["train"][0], train_end=window["train"][1],
+                                         early_stop_start=window["early_stop"][0], early_stop_end=window["early_stop"][1],
+                                         valid_start=window["validation"][0], valid_end=window["validation"][1],
+                                         validation_mse=loss, best_iteration=rounds))
+            mean = float(np.mean(losses))
+            trials.append(dict(trial=number, validation_mse=mean, **{key: model_params[key] for key in space}))
+            pd.DataFrame(trials).to_csv(out / "trials.csv", index=False)
+            pd.DataFrame(fold_results).to_csv(out / "fold_trials.csv", index=False)
+            return mean
         with R.start(experiment_name="lightgbm_tuning", recorder_name=f"trial_{number:02d}"):
             model, curve, rank_metrics = fit_lightgbm(
                 dataset, model_params, settings["training_control"], title=f"LightGBM trial {number}/{grid_size}",
@@ -84,6 +103,17 @@ def tune_lightgbm(config: dict, out: Path, *, candidate_models: Path | None = No
         register_provider(Path(work), config["qlib_version"])
         evaluate()
         study.optimize(evaluate, n_trials=grid_size)
-    best = min(trials, key=lambda row: row["validation_mse"])
+        best = min(trials, key=lambda row: row["validation_mse"])
+        if windows:
+            dataset = tuning_dataset(config, out)
+            for row in trials if candidate_models is not None else [best]:
+                fitted_params = {**params, **{key: row[key] for key in space}}
+                with R.start(experiment_name="lightgbm_refit", recorder_name=f"trial_{row['trial']:02d}"):
+                    model, curve, _ = fit_lightgbm(dataset, fitted_params, settings["training_control"])
+                if candidate_models is not None:
+                    model.model.save_model(str(candidate_models / f"{row['trial']}.txt"))
+                if row["trial"] == best["trial"]:
+                    model.model.save_model(str(out / "lightgbm.txt"))
+                    curve.to_csv(out / "best_training_mse.csv", index=False)
     best_config = dict(config, lightgbm={**config["lightgbm"], **{key: best[key] for key in space}})
     write_best_config(out, best_config)

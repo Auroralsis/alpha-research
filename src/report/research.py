@@ -327,7 +327,8 @@ def write_equal_weight(config: dict, source: Path, out: Path, directions: pd.Dat
     ridge_section = ""
     if with_ridge:
         trials = pd.read_csv(out / "ridge_trials.csv").set_index("alpha")
-        best = trials.validation_mse.idxmin()
+        criterion = "fold_mean_mse" if "fold_mean_mse" in trials else "validation_mse"
+        best = trials[criterion].idxmin()
         labels["ridge_strong"] = f"强正则 Ridge（α={best:,.0f}）"
         strategies = ["ridge_strong", "equal_weight"]
         trial_table = markdown_table(["α", "训练 MSE", "验证 MSE", "训练 Rank IC", "验证 Rank IC", "系数 L2 范数"],
@@ -339,7 +340,7 @@ def write_equal_weight(config: dict, source: Path, out: Path, directions: pd.Dat
 
 {trial_table}
 
-Ridge 的输入为 158 列中性化特征。训练期拟合缺失值中位数、标准化参数及线性系数，训练和验证沿用来源实验的 `{config['training_label']}` 收益标签并剔除跨期标签。α 越大，平方误差总和中附加的系数惩罚越强。按验证 MSE 选定 α={best:,.0f} 用于测试期回测。测试期沿用项目此前的研究区间。
+Ridge 的输入为 158 列中性化特征。训练期拟合缺失值中位数、标准化参数及线性系数，训练和验证沿用来源实验的 `{config['training_label']}` 收益标签并剔除跨期标签。α 越大，平方误差总和中附加的系数惩罚越强。按 {criterion} 选定 α={best:,.0f} 用于测试期回测。测试期沿用项目此前的研究区间。
 
 [各档正则化指标]({links}/ridge_trials.csv) · [最佳配置]({links}/best_config.json) · [最优模型及预处理器]({links}/ridge.joblib)
 
@@ -514,9 +515,11 @@ def write_bottom_comparison(out: Path) -> Path:
     held_rate = held.groupby("strategy").held_bottom_rate.mean()
     port = pd.read_csv(out / "portfolio_metrics.csv").groupby("strategy").mean(numeric_only=True)
     valid = top.loc["validation"]
-    winner = valid.loc[list(gains)].sort_values(["bottom_rate", "top_return"], ascending=[True, False]).index[0]
-    baseline = valid.loc["quintile"]
-    candidates = valid.loc[list(gains)]
+    selection = (pd.read_csv(out / "fold_trials.csv").groupby("strategy").mean(numeric_only=True)
+                 if (out / "fold_trials.csv").exists() else valid)
+    winner = selection.loc[list(gains)].sort_values(["bottom_rate", "top_return"], ascending=[True, False]).index[0]
+    baseline = selection.loc["quintile"]
+    candidates = selection.loc[list(gains)]
     improved = candidates.loc[candidates.bottom_rate.lt(baseline.bottom_rate) &
                               candidates.top_return.ge(baseline.top_return)]
     joint_result = ("同时达到这两个目标的方案有" + "、".join(names[n] for n in improved.index) + "。"
@@ -547,7 +550,7 @@ def write_bottom_comparison(out: Path) -> Path:
                        dict(quintile="#6843a6", decile="#cb701b", **colors))
     return save_report(report, f"""# 中证500选股 · 单独标记真实收益后 {k} 名
 
-{len(gains)} 组增益中，{names[winner]}的验证集误选率最低，为 {valid.at[winner, 'bottom_rate']:.2%}。它的入选股票平均远期收益为 {valid.at[winner, 'top_return']:.4%}，原五档为 {valid.at['quintile', 'top_return']:.4%}。{joint_result}测试期该方案扣费累计收益为 {port.at[winner, 'total_return']:.2%}，原五档为 {port.at['quintile', 'total_return']:.2%}。
+{len(gains)} 组增益中，{names[winner]}的验证集误选率最低，为 {selection.at[winner, 'bottom_rate']:.2%}。它的入选股票平均远期收益为 {selection.at[winner, 'top_return']:.4%}，原五档为 {selection.at['quintile', 'top_return']:.4%}。{joint_result}测试期该方案扣费累计收益为 {port.at[winner, 'total_return']:.2%}，原五档为 {port.at['quintile', 'total_return']:.2%}。
 
 每天按真实远期收益从低到高排名，后 {k} 名及边界并列股票记为 0，其余按平均名次等分为 1–9 档。增益的第一个间距取 {"、".join(str(g[1]) for g in gains.values())}，其余相邻档间距均为 1。各组共用 MAD 截尾 Alpha158、树参数、训练期及验证期，均按自身验证 NDCG@{k} 早停。比较候选时优先看验证误选率，再看入选平均收益。
 

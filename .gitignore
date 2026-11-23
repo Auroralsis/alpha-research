@@ -3,6 +3,7 @@ PANDAS_DATAFRAME_GUIDE.md
 ./AGENTS.md
 
 *.png
+!/docs/results/csi500_research/**/*.png
 __pycache__/
 *.pyc
 
@@ -13,8 +14,13 @@ tutorials/*
 !/data/reference/csi500/
 !/data/reference/csi500/industry_l1_history.parquet
 !/data/reference/csi500/industry_gap_audit.parquet
-results
-results/*
+/results/
+/docs/results/*
+!/docs/results/csi500_research.md
+!/docs/results/csi500_research/
+!/docs/results/expanding_pair_daily.md
+!/docs/results/sliding_pair_daily.md
+!/docs/results/strategy_summary_daily.md
 tmp
 /.venv-ml/
 .env

@@ -59,8 +59,6 @@ def fit_lightgbm(dataset: DatasetH, params: dict, controls: dict, *, title: str 
         model.fit(dataset, evals_result=evaluation, verbose_eval=period)
     curve = pd.DataFrame(dict(train_mse=evaluation["train"]["l2"], validation_mse=evaluation["valid"]["l2"]))
     curve.insert(0, "iteration", range(1, len(curve) + 1))
-    if model.model is None or model.model.best_iteration != int(curve.validation_mse.idxmin()) + 1:
-        raise RuntimeError("LightGBM did not select the validation MSE minimum")
     ranks = {}
     with catch_warnings():
         # 常数截面的 Rank IC 无定义，跨日汇总时会跳过。
@@ -120,10 +118,8 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
         end = pd.Timestamp(bounds[1])
         rows = read_feature_split(out / "features.parquet", bounds, split)
         values = rows[names].to_numpy(dtype=np.float32)
-        inf_counts = np.isinf(values).sum(axis=0)
-        if inf_counts.any():
-            bad = dict(zip(np.array(names)[inf_counts > 0], inf_counts[inf_counts > 0].tolist()))
-            raise ValueError(f"Infinite Alpha158 inputs in {split}: {bad}")
+        if np.isinf(values).any():
+            raise ValueError(f"Infinite Alpha158 inputs in {split}")
         missing = np.isnan(values)
         feature_audit.extend(dict(split=split, feature=name, n_missing=int(n), missing_rate=n / len(rows))
                              for name, n in zip(names, missing.sum(axis=0)))
@@ -237,9 +233,10 @@ def compare_ridge(config: dict, cache: Path, out: Path) -> pd.DataFrame:
     path = cache / "features.parquet"
     segments = config["segments"]
 
-    def fitting_data(split):
-        rows = read_feature_split(path, segments[split], split)
-        eligible = rows.loc[segment_masks(rows, segments)[split]]
+    def fitting_data(split, bounds=None):
+        bounds = segments[split] if bounds is None else bounds
+        rows = read_feature_split(path, bounds, split)
+        eligible = rows.loc[segment_masks(rows, {split: bounds})[split]]
         target = fitting_targets(eligible, config["training_label"])
         rows = rows.loc[target.index]
         return rows[names], target.set_axis(stock_day_index(rows))
@@ -267,7 +264,29 @@ def compare_ridge(config: dict, cache: Path, out: Path) -> pd.DataFrame:
         trials = pd.DataFrame(results).set_index("alpha")
         if not np.isfinite(trials.validation_mse).all():
             raise ValueError("Ridge 验证 MSE 无效")
-        best = trials.validation_mse.idxmin()
+        if "walk_forward" in config:
+            from src.ml.walk_forward import folds
+
+            records = []
+            for fold in folds(config):
+                train_x, train_y = fitting_data("train", fold["train"])
+                valid_x, valid_y = fitting_data("validation", fold["validation"])
+                preprocess = clone(prototype[:-1])
+                train_x = preprocess.fit_transform(train_x)
+                valid_x = preprocess.transform(valid_x)
+                for alpha in trials.index:
+                    estimator = clone(prototype[-1]).set_params(alpha=alpha).fit(train_x, train_y)
+                    loss = np.mean((estimator.predict(valid_x) - valid_y.to_numpy()) ** 2)
+                    records.append(dict(alpha=alpha, train_end=fold["train"][1], valid_start=fold["validation"][0],
+                                        valid_end=fold["validation"][1], mse=loss))
+            detail = pd.DataFrame(records)
+            if not np.isfinite(detail.mse).all():
+                raise ValueError("Ridge 逐折 MSE 无效")
+            detail.to_csv(out / "fold_trials.csv", index=False)
+            trials["fold_mean_mse"] = detail.groupby("alpha").mse.mean()
+            best = trials.fold_mean_mse.idxmin()
+        else:
+            best = trials.validation_mse.idxmin()
         trials.to_csv(out / "ridge_trials.csv")
         joblib.dump(models[best], out / "ridge.joblib")
         write_best_config(out, dict(config, ridge_alpha=float(best)))

@@ -25,8 +25,6 @@ def run(model):
         import torch
 
         device = torch.device(settings["listfold_mlp"].get("device", "cuda"))
-        if device.type not in ("cuda", "cpu"):
-            raise ValueError("listfold_mlp.device 请使用 cuda、cuda:编号 或 cpu")
         if device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("当前 PyTorch 无法使用 CUDA，请检查 quant 环境和显卡驱动，或将 listfold_mlp.device 设为 cpu。")
         device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"

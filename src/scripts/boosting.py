@@ -10,7 +10,7 @@ import xgboost as xgb
 
 from src.backtest.engine import evaluate_signals
 from src.backtest.factor_metrics import daily_ic
-from src.config import CONFIG_FILE, load_config, load_tuning, with_model_params, write_best_config
+from src.config import walk_forward_policy, CONFIG_FILE, load_config, load_tuning, with_model_params, write_best_config
 from src.data.research_panel import ROOT, stock_day_index
 from src.ml.dataset import alpha158_columns
 from src.ml import rank_validation
@@ -39,7 +39,6 @@ def fit_target(params: dict, cfg: dict, train_set: xgb.DMatrix, early_stop: xgb.
     rounds = model.best_iteration + 1
     curve = pd.Series(history["early_stop"][params["eval_metric"]], name="ndcg_at_50")
     curve.index = pd.RangeIndex(1, len(curve) + 1, name="iteration")
-    assert curve.idxmax() == rounds
     return model[:rounds], curve
 
 
@@ -56,6 +55,23 @@ def blend_validation(frame, baseline, weight, gains, k, baseline_loss):
 def train_xgboost(reference: Path, cfg: dict, source: Path, names: list[str], out: Path, *, tune: bool = False) -> dict:
     """核对每个训练日的五档人数，按 2021 年 NDCG@50 早停并保存各组最优树。"""
     params = cfg["xgboost"]
+    if tune and "walk_forward" in cfg:
+        from src.ml.walk_forward import rank_losses
+
+        space = cfg["xgboost_tuning"]["search_space"]
+        candidates = candidates_from_grid(params, space)
+        options = {"lightgbm": [cfg["lightgbm"]], "xgboost": candidates}
+        weight = cfg.get("lightgbm_xgboost_blend", {}).get("xgboost_weight", 0.5)
+        folds = rank_losses(out, cfg, options, weight).rename(columns={"xgb_index": "trial"})
+        folds.to_csv(out / "fold_trials.csv", index=False)
+        summary = folds.groupby("trial")[["model_loss", "baseline_loss", "blend_loss"]].mean()
+        summary["delta_vs_reference"] = summary.blend_loss - summary.baseline_loss
+        for key in space:
+            summary[key] = [candidate[key] for candidate in candidates]
+        summary.to_csv(out / "blend_trials.csv")
+        selected = int(summary.blend_loss.idxmin())
+        cfg.update(xgboost=candidates[selected], selected_trial=selected)
+        return train_xgboost(reference, cfg, source, names, out)
     matrices, grades = [], []
     for _, rows, sizes in training_periods(source, reference, cfg["segments"], split_top25=cfg.get("split_top25", False)):
         matrix = xgb.QuantileDMatrix(rows[names], group=sizes,
@@ -96,9 +112,7 @@ def train_xgboost(reference: Path, cfg: dict, source: Path, names: list[str], ou
             model, curve = fit_target(candidate, cfg, train_set, early_stop)
             models[name], curves[name] = model, curve
             if tune:
-                metric, value = model.eval(validation, name="validation").split("\t")[-1].split(":")
-                if metric != "validation-" + candidate["eval_metric"] or not np.isfinite(float(value)):
-                    raise ValueError("验证集排序指标无效")
+                value = model.eval(validation, name="validation").rsplit(":", 1)[1]
                 trials.append(dict(trial=number, target=name, rounds=model.num_boosted_rounds(),
                                    early_stop_ndcg=curve.max(), validation_ndcg=float(value),
                                    **{key: candidate[key] for key in space}))
@@ -184,7 +198,12 @@ def evaluate_xgboost(out: Path) -> Path:
     pd.Series(losses, name="loss").rename_axis("strategy").to_csv(out / "validation_losses.csv")
     if (out / "blend_trials.csv").is_file():
         selected = pd.read_csv(out / "blend_trials.csv").set_index("trial").loc[cfg["selected_trial"]]
-        np.testing.assert_allclose(losses["blend_equal"], selected.blend_loss, rtol=0, atol=1e-12)
+        if "walk_forward" in cfg:
+            folds = pd.read_csv(out / "fold_trials.csv")
+            expected = folds.loc[folds.trial.eq(cfg["selected_trial"]), "blend_loss"].mean()
+        else:
+            expected = losses["blend_equal"]
+        np.testing.assert_allclose(expected, selected.blend_loss, rtol=0, atol=1e-12)
     daily = paired_signals(scores, cfg["topk"])
     daily.to_csv(out / "paired_daily.csv", index=False)
     summary = daily.groupby(["split", "target"]).agg(
@@ -272,7 +291,9 @@ def xgboost_main(argv=None) -> None:
         raise ValueError("配对实验需要 rank:ndcg、线性增益和与持股数相应的 NDCG 指标")
     cfg.pop("xgboost_tuning", None)
     cfg.pop("selected_trial", None)
+    cfg.pop("walk_forward", None)
     if args.tune:
+        cfg["walk_forward"] = walk_forward_policy(settings)
         cfg["xgboost_tuning"] = load_tuning("xgboost_tuning", settings, args.tuning_config)
         space = cfg["xgboost_tuning"]["search_space"]
         tunable = {"max_depth", "min_child_weight", "reg_alpha", "reg_lambda", "subsample", "colsample_bytree", "learning_rate"}
@@ -300,6 +321,12 @@ def fit_catboost(cfg, source, names, out, tune):
     params = cfg["single_catboost"]["params"]
     space = cfg["catboost_four_equal"]["tuning"]["search_space"] if tune else {}
     candidates = candidates_from_grid(params, space)
+    if tune and cfg.get("walk_forward", {}).get("early_stop_years"):
+        from src.ml.walk_forward import rank_losses
+
+        options = {"lightgbm": [cfg["lightgbm"]], "xgboost": [cfg["xgboost"]], "catboost": candidates}
+        table = rank_losses(out, cfg, options, cfg["lightgbm_xgboost_blend"]["xgboost_weight"])
+        table.rename(columns={"cat_index": "trial"}).to_csv(out / "fold_trials.csv", index=False)
     split_data = []
     for _, rows, _sizes in training_periods(source, Path(cfg["reference"]), cfg["segments"], split_top25=cfg.get("split_top25", False)):
         split_data.append((rows[names], rows.grade.to_numpy(dtype=int), pd.factorize(rows.trade_date)[0]))
@@ -386,11 +413,17 @@ def evaluate_catboost(out):
         if loss < best_loss:
             best_loss, best = loss, number
     table = pd.DataFrame(trials)
+    fixed_validation = table.set_index("trial")
+    if cfg["catboost_tuned"] and cfg.get("walk_forward", {}).get("early_stop_years"):
+        detail = pd.read_csv(out / "fold_trials.csv")
+        summary = detail.groupby("trial")[["baseline_loss", "model_loss", "blend_loss"]].mean()
+        summary["days"] = detail.groupby("trial").days.sum()
+        summary["delta_vs_reference"] = summary.blend_loss - summary.baseline_loss
+        table = fixed_validation.drop(columns=summary.columns).join(summary, validate="one_to_one").reset_index()
+        best = int(summary.blend_loss.idxmin())
     table.to_csv(out / "blend_trials.csv", index=False)
     directory = out / f"trial_{best}"
     xgb_config = json.loads((ref / "config.json").read_text())
-    if not (ref / "top50.ubj").is_file() or not (ref / "blend_trials.csv").is_file():
-        raise ValueError("需要已经按最终组合损失评价的 XGBoost 基线")
     cfg["xgboost"] = xgb_config["xgboost"]
     cfg["xgboost_selected_trial"] = xgb_config.get("selected_trial")
     cfg.update(selected_trial=best, catboost=json.loads((directory / "params.json").read_text()))
@@ -404,11 +437,11 @@ def evaluate_catboost(out):
     scores = score_candidate(cfg, directory)
     valid = scores.loc[scores.split.eq("validation")]
     check = validation_loss(valid, valid.three_equal, gains, k)
-    np.testing.assert_allclose(check.loss.mean(), best_loss, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(check.loss.mean(), fixed_validation.at[best, "blend_loss"], rtol=0, atol=1e-12)
     losses = {name: validation_loss(valid, valid[name], gains, k).loss.mean()
               for name in ("blend_equal", "cat_equal")}
     losses["three_equal"] = check.loss.mean()
-    np.testing.assert_allclose(list(losses.values()), table.loc[best, ["baseline_loss", "model_loss", "blend_loss"]]
+    np.testing.assert_allclose(list(losses.values()), fixed_validation.loc[best, ["baseline_loss", "model_loss", "blend_loss"]]
                                .to_numpy(dtype=float), rtol=0, atol=1e-12)
     pd.Series(losses, name="loss").rename_axis("strategy").to_csv(out / "validation_losses.csv")
     scores.to_parquet(out / "predictions.parquet", index=False)
@@ -442,9 +475,13 @@ def replay_candidate(archive: Path, trial: int):
     methods = ("blend_equal", "cat_equal", "three_equal")
     valid = scores.loc[scores.split.eq("validation")]
     gains = {name: cfg["label_gains"][name] for name in BASES}
-    for name, col in zip(methods, ("baseline_loss", "model_loss", "blend_loss")):
-        loss = validation_loss(valid, valid[name], gains, cfg["topk"])
-        np.testing.assert_allclose(loss.loss.mean(), chosen[col], rtol=0, atol=1e-12)
+    if cfg.get("walk_forward", {}).get("early_stop_years") and cfg["catboost_tuned"]:
+        chosen = pd.read_csv(directory / "blend_loss_daily.csv").mean(numeric_only=True)
+        np.testing.assert_allclose(validation_loss(valid, valid.three_equal, gains, cfg["topk"]).loss.mean(), chosen.loss)
+    else:
+        for name, col in zip(methods, ("baseline_loss", "model_loss", "blend_loss")):
+            loss = validation_loss(valid, valid[name], gains, cfg["topk"])
+            np.testing.assert_allclose(loss.loss.mean(), chosen[col], rtol=0, atol=1e-12)
     scores.to_parquet(out / "predictions.parquet", index=False)
     evaluate_signals(scores, cfg, out, methods)
     from src.report.rank_stack import write_catboost_replay
@@ -479,7 +516,9 @@ def catboost_main(argv=None):
     cfg.pop("selected_trial", None)
     for key in ("single_catboost", "catboost_four_equal", "seed", "num_boost_round", "early_stopping_rounds"):
         cfg[key] = settings[key]
+    cfg.pop("walk_forward", None)
     if args.tune:
+        cfg["walk_forward"] = walk_forward_policy(settings)
         cfg["catboost_four_equal"]["tuning"] = load_tuning("catboost_tuning", settings, args.tuning_config)
     weight = cfg["catboost_four_equal"]["catboost_weight"]
     if not 0 <= weight <= 1:

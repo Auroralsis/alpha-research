@@ -2,7 +2,6 @@
 import argparse
 import hashlib
 import json
-import math
 from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +12,7 @@ import pandas as pd
 import xgboost as xgb
 
 from src.backtest.engine import evaluate_signals
-from src.config import CONFIG_FILE, load_tuning, write_best_config
+from src.config import walk_forward_policy, CONFIG_FILE, load_tuning, write_best_config
 from src.ml.dataset import alpha158_columns, read_feature_split
 from src.ml.rank_validation import (
     BASES, aligned_reference, equal_ranks, fixed_grades, read_period, selection_stats, training_periods, validation_loss,
@@ -33,23 +32,20 @@ def candidate_id(params):
 
 
 def check_config(cfg):
-    """校验逐阶段搜索的范围及实际会启用的采样设置。"""
+    """核对搜索阶段和组合口径，树参数由对应的训练器校验。"""
     grid = cfg["rank_pair_tuning"]
     stages = grid.get("stages", STAGES)
-    if not isinstance(stages, (list, tuple)) or not stages or any(s not in STAGES for s in stages) or len(stages) != len(set(stages)):
+    if not stages or set(stages) - set(STAGES) or len(stages) != len(set(stages)):
         raise ValueError("rank_pair_tuning.stages 需要有效且不重复的搜索阶段")
-    fields = {"leaves": ["leaf_cap_fractions"], "min_child": ["min_data_in_leaf", "min_child_weight"]}
-    for name in (key for stage in stages for key in fields.get(stage, [stage])):
-        values = grid.get(name)
-        if not isinstance(values, list) or not values:
-            raise ValueError(f"rank_pair_tuning.{name} 须给出非空候选列表")
-        for value in values:
-            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} 候选须为非负有限数")
-            if name in ("depth", "min_data_in_leaf") and (type(value) is not int or value < 1):
-                raise ValueError(f"{name} 候选须为正整数")
-            if name in ("leaf_cap_fractions", "row_sampling", "column_sampling") and not 0 < value <= 1:
-                raise ValueError(f"{name} 候选须在 (0, 1] 内")
+    fields = {"leaves": ("leaf_cap_fractions",), "min_child": ("min_data_in_leaf", "min_child_weight")}
+    for stage in stages:
+        for key in fields.get(stage, (stage,)):
+            if not grid[key]:
+                raise ValueError(f"rank_pair_tuning.{key} 需要至少一个候选值")
+    if "leaves" in stages and not all(0 < f <= 1 for f in grid["leaf_cap_fractions"]):
+        raise ValueError("leaf_cap_fractions 须在 (0, 1] 内")
+    if "depth" in stages and any(type(d) is not int or d < 1 for d in grid["depth"]):
+        raise ValueError("depth 候选须为正整数")
     if "row_sampling" in stages and cfg["lightgbm"].get("bagging_freq", cfg["lightgbm"].get("subsample_freq", 0)) <= 0:
         raise ValueError("LightGBM 行采样需要正的 bagging_freq")
     if cfg["lightgbm_xgboost_blend"]["xgboost_weight"] != 0.5 or any(len(cfg["label_gains"][n]) != 5 for n in BASES):
@@ -88,7 +84,7 @@ def scoring_inputs(cfg):
     return blocks
 
 
-def train_candidate(out, family, params, cfg, blocks, xmat, valid_x):
+def train_candidate(out, family, params, cfg, blocks, xmat, valid_x=None):
     """同一树参数训练 A–D 四个目标；完整写出一个目标后即可断点接续。"""
     directory = out / family / candidate_id(params)
     directory.mkdir(parents=True, exist_ok=True)
@@ -112,7 +108,8 @@ def train_candidate(out, family, params, cfg, blocks, xmat, valid_x):
                     model = fit_ranker(matrices, dict(params, label_gain=gains), cfg, temp)
                     (temp / "training_ndcg.csv").replace(folder / "training_ndcg.csv")
                     (temp / "lambdarank.txt").replace(path)
-            predictions[target] = model.predict(valid_x, num_threads=params["num_threads"])
+            if valid_x is not None:
+                predictions[target] = model.predict(valid_x, num_threads=params["num_threads"])
         else:
             path = folder / "model.ubj"
             if path.exists():
@@ -126,8 +123,10 @@ def train_candidate(out, family, params, cfg, blocks, xmat, valid_x):
                 tmp = folder / "model.tmp.ubj"
                 model.save_model(tmp)
                 tmp.replace(path)
-            predictions[target] = model.inplace_predict(valid_x)
-    return pd.DataFrame(predictions, index=valid_x.index)
+            if valid_x is not None:
+                predictions[target] = model.inplace_predict(valid_x)
+    if valid_x is not None:
+        return pd.DataFrame(predictions, index=valid_x.index)
 
 
 def quantile_matrices(blocks, params):
@@ -139,8 +138,55 @@ def quantile_matrices(blocks, params):
     return matrices
 
 
+def tune_walk_forward(out, cfg, *, blocks=None, fold_features=None, extra=None):
+    """按各历史验证窗的平均组合损失推进搜索，最终模型单独拟合。"""
+    from src.ml.walk_forward import rank_losses
+
+    best = {family: cfg[family] for family in FAMILIES}
+    fold_tables, summaries, stages = [], [], []
+    for stage in cfg["rank_pair_tuning"].get("stages", STAGES):
+        options = {f: candidates(stage, f, best[f], cfg["rank_pair_tuning"]) for f in FAMILIES}
+        table = rank_losses(out, cfg, options, 0.5, fold_features=fold_features, extra=extra)
+        for family, column in zip(FAMILIES, ("light_index", "xgb_index")):
+            ids = []
+            for params in options[family]:
+                key = candidate_id(params)
+                folder = out / family / key
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "params.json").write_text(json.dumps(params, indent=2))
+                ids.append(key)
+            table[family] = table[column].map(dict(enumerate(ids)))
+        table["stage"] = stage
+        fold_tables.append(table)
+        pairs = table.groupby(["light_index", "xgb_index"], sort=False).agg(
+            loss=("blend_loss", "mean"), lightgbm=("lightgbm", "first"), xgboost=("xgboost", "first"),
+            folds=("blend_loss", "size")).assign(stage=stage)
+        i, j = pairs.loss.idxmin()
+        best = {"lightgbm": options["lightgbm"][i], "xgboost": options["xgboost"][j]}
+        summaries.append(pairs.reset_index(drop=True))
+        stages.append(dict(stage=stage, before=pairs.loss.iloc[0], loss=pairs.loss.min(), pairs=len(pairs),
+                           **{f: candidate_id(best[f]) for f in FAMILIES}))
+        pd.concat(fold_tables).to_csv(out / "fold_trials.csv", index=False)
+        pd.concat(summaries).to_csv(out / "trials.csv", index=False)
+        pd.DataFrame(stages).to_csv(out / "stages.csv", index=False)
+
+    # 正式模型按原归档的训练和早停区间拟合，测试期始终留给 evaluate。
+    if blocks is None:
+        blocks = scoring_inputs(cfg)
+    for family, params in best.items():
+        if params != cfg[family]:
+            matrices = quantile_matrices(blocks, params) if family == "xgboost" else []
+            train_candidate(out, family, params, cfg, blocks, matrices)
+    temp = out / "winners.tmp"
+    temp.write_text(json.dumps(best, indent=2))
+    temp.replace(out / "winners.json")
+    return best
+
+
 def tune(out, cfg):
     """冻结每一阶段的最优组合，下一阶段以此为起点；只使用验证期最终排名选参。"""
+    if "walk_forward" in cfg:
+        return tune_walk_forward(out, cfg)
     source, ref = Path(cfg["feature_source"]), Path(cfg["pair_reference"])
     valid = read_period(source, cfg["segments"]["validation"])
     valid_x = valid[alpha158_columns(source)]
@@ -150,14 +196,19 @@ def tune(out, cfg):
     del valid
     gains = {n: cfg["label_gains"][n] for n in BASES}
     baseline = {f: cfg[f] for f in FAMILIES}
-    best = baseline.copy()
     base_ids = [candidate_id(baseline[f]) for f in FAMILIES]
     cache = {base_ids[0]: old.equal, base_ids[1]: old.xgb_equal}
     base_daily = validation_loss(keys, old.blend_equal, gains, cfg["topk"])
     base_loss = base_daily.loss.mean()
     expected = pd.read_csv(ref / "validation_losses.csv").set_index("strategy").at["blend_equal", "loss"]
     np.testing.assert_allclose(base_loss, expected, rtol=0, atol=1e-12)
-    blocks = scoring_inputs(cfg)
+    return search_pair(out, cfg, valid_x, keys, cache, scoring_inputs(cfg))
+
+
+def search_pair(out, cfg, valid_x, keys, cache, blocks):
+    """在给定特征上搜索，以八个排名等权后的验证损失选出阶段最优参数。"""
+    best = {family: cfg[family] for family in FAMILIES}
+    gains = {name: cfg["label_gains"][name] for name in BASES}
     xmat = quantile_matrices(blocks, cfg["xgboost"])
     trials, winners = [], []
     for stage in cfg["rank_pair_tuning"].get("stages", STAGES):
@@ -246,8 +297,11 @@ def evaluate(out, cfg, best):
         if split == "validation":
             gains = {n: cfg["label_gains"][n] for n in BASES}
             daily = validation_loss(s, s.blend_equal, gains, cfg["topk"])
-            archived = pd.read_csv(out / "validation_loss_daily.csv", parse_dates=["trade_date"])
-            pd.testing.assert_frame_equal(daily.reset_index(drop=True), archived, atol=1e-12, rtol=1e-12)
+            if "walk_forward" in cfg:
+                daily.to_csv(out / "validation_loss_daily.csv", index=False)
+            else:
+                archived = pd.read_csv(out / "validation_loss_daily.csv", parse_dates=["trade_date"])
+                pd.testing.assert_frame_equal(daily.reset_index(drop=True), archived, atol=1e-12, rtol=1e-12)
             monthly = pd.DataFrame(index=pd.DatetimeIndex(daily.trade_date))
             for name in ("baseline", "equal", "xgb_equal", "blend_equal"):
                 result = validation_loss(s, s[name], gains, cfg["topk"]).set_index("trade_date")
@@ -262,17 +316,18 @@ def evaluate(out, cfg, best):
     print(write_pair_tuning(out), flush=True)
 
 
-def expanding_years(segments):
-    """每年年初定一次模型，训练起点不动，前一自然年专用于早停。"""
+def expanding_years(segments, *, sliding=False):
+    """每年用前一自然年早停；滑动模式保留首窗的训练年数。"""
     first = pd.Timestamp(segments["train"][0])
     start, end = map(pd.Timestamp, segments["test"])
     if start > end or first.year >= start.year - 1:
-        raise ValueError("扩展训练至少需要一个训练年度和一个独立早停年度")
+        raise ValueError("滚动训练至少需要一个训练年度和一个独立早停年度")
     if "validation" in segments and pd.Timestamp(segments["validation"][1]) >= start:
         raise ValueError("冻结树参数所用的验证集必须结束于首个预测日之前")
     for year in range(start.year, end.year + 1):
+        train_start = first + pd.DateOffset(years=year - start.year) if sliding else first
         yield year, {
-            "train": [str(first.date()), f"{year - 2}-12-31"],
+            "train": [str(train_start.date()), f"{year - 2}-12-31"],
             "early_stop": [f"{year - 1}-01-01", f"{year - 1}-12-31"],
             "test": [max(str(start.date()), f"{year}-01-01"), min(str(end.date()), f"{year}-12-31")],
         }
@@ -296,7 +351,7 @@ def expanding_window(out, cfg, year, bounds, names):
         blocks.append((rows[names], rows.grade.to_numpy(dtype=int), groups))
         del frame, rows
     pd.DataFrame(audit).to_csv(folder / "periods.csv", index=False)
-    test = read_feature_split(source / "features.parquet", bounds["test"], "扩展窗口").sort_values(["trade_date", "ticker"])
+    test = read_feature_split(source / "features.parquet", bounds["test"], "滚动预测").sort_values(["trade_date", "ticker"])
     scores = test[["trade_date", "ticker", "label", "label_end_date"]].copy()
     for family, prefix in (("lightgbm", "lgb_"), ("xgboost", "xgb_")):
         print(f"{year} 年 {family} 训练四个排序器", flush=True)
@@ -305,45 +360,50 @@ def expanding_window(out, cfg, year, bounds, names):
         preds = train_candidate(folder, family, params, cfg, blocks, matrices, test[names])
         scores[preds.add_prefix(prefix).columns] = preds.to_numpy()
         scores[prefix + "equal"] = equal_ranks(scores, [prefix + n for n in BASES])
-    scores["expanding"] = (scores.lgb_equal + scores.xgb_equal) / 2
+    method = "sliding" if cfg.get("rolling_scheme") == "sliding_annual" else "expanding"
+    scores[method] = (scores.lgb_equal + scores.xgb_equal) / 2
     return scores.assign(window=year)
 
 
 def rolling_pair_main(argv=None):
-    """按年扩展训练集，用冻结的混合模型参数做连续样本外回测。"""
+    """按年滚动训练，用冻结的混合模型参数做连续样本外回测。"""
     parser = argparse.ArgumentParser(description=rolling_pair_main.__doc__)
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--reference", type=Path, help="已完成联合调参的固定模型归档")
-    choice.add_argument("--resume", type=Path, help="从本次扩展窗口归档的已完成模型继续")
+    choice.add_argument("--resume", type=Path, help="从本次滚动窗口归档的已完成模型继续")
+    parser.add_argument("--window", choices=("expanding", "sliding"), help="固定起点扩展（默认）或固定年数滑动")
     args = parser.parse_args(argv)
     if args.resume:
         out = args.resume.resolve()
         cfg = json.loads((out / "config.json").read_text())
         reference = Path(cfg["fixed_pair_reference"])
+        if args.window and cfg["rolling_scheme"] != args.window + "_annual":
+            parser.error("--window 与接续实验的配置不一致")
     else:
         reference = (args.reference or latest_run("winners.json", "candidate_parameters.csv",
                      "ledger.parquet", "predictions.parquet", rebalance_days=1)).resolve()
         cfg = json.loads((reference / "config.json").read_text())
         cfg.update(json.loads((reference / "winners.json").read_text()), fixed_pair_reference=str(reference),
-                   rolling_scheme="expanding_annual", early_stop_years=1)
+                   rolling_scheme=(args.window or "expanding") + "_annual", early_stop_years=1)
         if cfg["lightgbm_xgboost_blend"]["xgboost_weight"] != 0.5:
             raise ValueError("本实验要求两类模型各占一半")
-        out = new_run(cfg["rebalance_days"], tag="expanding_pair")
+        out = new_run(cfg["rebalance_days"], tag=(args.window or "expanding") + "_pair")
         out.mkdir()
         (out / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
     print(out, flush=True)
     names = alpha158_columns(Path(cfg["feature_source"]))
-    windows = dict(expanding_years(cfg["segments"]))
+    method = cfg["rolling_scheme"].removesuffix("_annual")
+    windows = dict(expanding_years(cfg["segments"], sliding=method == "sliding"))
     scores = pd.concat([expanding_window(out, cfg, year, bounds, names) for year, bounds in windows.items()],
                        ignore_index=True).assign(split="test")
     # 整段测试期统一核验收益标签，保留跨年但仍在测试期内的收益与信号。
     scores["evaluable"] = segment_masks(scores, {"test": cfg["segments"]["test"]})["test"]
     scores["grade"] = fixed_grades(scores.loc[scores.evaluable]).reindex(scores.index).astype("Int8")
     scores["fixed"] = aligned_reference(reference, scores, "test", ["blend_equal"], check_labels=True).blend_equal
-    if not np.isfinite(scores[["expanding", "fixed"]]).all(axis=None):
+    if not np.isfinite(scores[[method, "fixed"]]).all(axis=None):
         raise ValueError("固定或滚动预测含无效分数")
     scores.to_parquet(out / "predictions.parquet", index=False)
-    methods = ("expanding", "fixed")
+    methods = (method, "fixed")
     gains = {name: cfg["label_gains"][name] for name in BASES}
     ndcg = pd.concat([validation_loss(scores, scores[name], gains, cfg["topk"]).assign(strategy=name)
                       for name in methods])
@@ -382,6 +442,8 @@ def main(argv=None):
         settings = json.loads(args.config.read_text())
         cfg.update(rank_pair_tuning=load_tuning("rank_pair_tuning", settings, args.tuning_config),
                    pair_reference=str(ref.resolve()))
+        cfg.pop("walk_forward", None)
+        cfg["walk_forward"] = walk_forward_policy(settings)
         check_config(cfg)
         out = new_run(cfg["rebalance_days"], tag="pair_tuning")
         out.mkdir()

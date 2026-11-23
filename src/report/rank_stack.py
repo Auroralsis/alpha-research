@@ -295,7 +295,7 @@ def write_xgboost_report(out: Path, summary: pd.DataFrame, reference: Path) -> P
         rows.append([title, str(cfg["label_gains"][name]), curve.idxmax(), f"{curve.max():.5f}"])
     fit = markdown_table(["目标", "由低到高的五档增益", "XGBoost 最佳轮数", "2021 NDCG@50"], rows)
     tuning = ""
-    if tuned:
+    if tuned and not mixed_selection:
         trials = pd.read_csv(out / "trials.csv")
         keys = list(cfg["xgboost_tuning"]["search_space"])
         rows = []
@@ -314,13 +314,15 @@ def write_xgboost_report(out: Path, summary: pd.DataFrame, reference: Path) -> P
     if mixed_selection:
         keys = list(cfg["xgboost_tuning"]["search_space"])
         selected = pd.read_csv(out / "blend_trials.csv").set_index("trial").loc[cfg["selected_trial"]]
+        selection_period = "扩展窗等权平均" if "walk_forward" in cfg else "2022 年验证集"
+        detail = "fold_trials.csv" if "walk_forward" in cfg else "trials.csv"
         tuning = f"""本轮选择深度 **{cfg['xgboost']['max_depth']}**、最小子节点权重 **{cfg['xgboost']['min_child_weight']}**，混合损失 **{selected.blend_loss:.6f}**，相对纯 LightGBM 变化 **{selected.delta_vs_reference:+.6f}**。
 
-**表　2022 年验证集混合损失，越低越好**
+**表　{selection_period}混合损失，越低越好**
 
 {blend_loss_table(out, cfg, keys)}
 
-每个候选先生成两模型混合排名。用同一份排名分别对照 A–D 的真实增益，计算逐日 NDCG@50，再对四组和交易日等权取均值。验证损失为 1 减去该均值。原组合为 LightGBM 四组等权。[各组单独指标]({links}/trials.csv) · [混合选参明细]({links}/blend_trials.csv) · [所选配置]({links}/best_config.json)
+每个候选先生成两模型混合排名。用同一份排名分别对照 A–D 的真实增益，计算逐日 NDCG@50，再对四组和交易日等权取均值。验证损失为 1 减去该均值。原组合为 LightGBM 四组等权。[候选验证明细]({links}/{detail}) · [混合选参明细]({links}/blend_trials.csv) · [所选配置]({links}/best_config.json)
 
 """
     if not tuned and (out / "validation_losses.csv").is_file():
@@ -408,10 +410,11 @@ def write_catboost_report(out: Path) -> Path:
     w = cfg["catboost_four_equal"]["catboost_weight"]
     paths = {"blend_equal": "LightGBM + XGBoost", "cat_equal": "CatBoost", "three_equal": "Three models"}
     plot_rank_feature_paths(out, pd.read_parquet(out / "ledger.parquet"), paths, "catboost_comparison.png")
+    selection_period = "各折选参年等权汇总后" if (out / "fold_trials.csv").exists() else "在 2022 年验证期"
     title = "## CatBoost 正则化与三模型组合"
     return update_comparison_section(report, title, f"""{title}
 
-在 2022 年验证期，原两类模型混合损失为 **{row.baseline_loss:.6f}**，以 {w:.2%} 权重加入所选 CatBoost 后为 **{row.blend_loss:.6f}**，变化 **{row.delta_vs_reference:+.6f}**。表中比较的是各候选最终用于选股的混合分数。交易日内先用全部股票计算各组百分位，再在有有效未来收益的股票上评价前 50 名，同分按股票代码升序。
+{selection_period}，原两类模型混合损失为 **{row.baseline_loss:.6f}**，以 {w:.2%} 权重加入所选 CatBoost 后为 **{row.blend_loss:.6f}**，变化 **{row.delta_vs_reference:+.6f}**。表中比较的是各候选最终用于选股的混合分数。交易日内先用全部股票计算各组百分位，再在有有效未来收益的股票上评价前 50 名，同分按股票代码升序。
 
 **表　CatBoost 候选的混合验证损失，越低越好**
 
@@ -419,7 +422,7 @@ def write_catboost_report(out: Path) -> Path:
 
 单独使用 CatBoost 时，候选 {int(solo.name)} 的损失最低，为 **{solo.model_loss:.6f}**。按预先设定的混合权重，候选 {trial} 的组合损失最低，为 **{row.blend_loss:.6f}**。
 
-先冻结上一阶段选定的 LightGBM/XGBoost 混合，再选 CatBoost 参数。每天用同一份最终排名分别对照四组真实增益。损失等于 1 减去四组、各日等权平均的 NDCG@50。共 {int(row.days)} 个有标签的验证交易日。两阶段都用 2022 年选参，权重在选参前固定。[上一阶段四套 XGBoost 参数的比较]({os.path.relpath(xref / 'blend_trials.csv', report.parent)})
+先冻结上一阶段选定的 LightGBM/XGBoost 混合，再选 CatBoost 参数。每天用同一份最终排名分别对照四组真实增益。损失等于 1 减去四组、各日等权平均的 NDCG@50。共 {int(row.days)} 个有标签的验证交易日。权重在选参前固定。[上一阶段四套 XGBoost 参数的比较]({os.path.relpath(xref / 'blend_trials.csv', report.parent)})
 
 **表　2023–2025 年同目标的预测日均相关与名单重合**
 
@@ -553,12 +556,13 @@ def write_feature_comparison(out: Path) -> Path:
         xg = xgb.Booster()
         xg.load_model(out / "combined" / f"{target}.ubj")
         used_xgb.update(xg.get_score(importance_type="weight"))
+    loss_period = "各折选参年等权平均的" if (out / "fold_trials.csv").exists() else "2022 年"
     title = "## 华泰 Alpha101 输入对照"
     section = f"""{title}
 
 三组使用相同股票日，输入分别为 158、101 和 259 列。华泰因子按当日股票截面的中位数 ± 5 MAD 截尾，MAD 为零时保留原值。少数公式自带的行业运算沿用项目的申万一级行业，算出因子后只做截尾。某列缺分时仍保留该股票日，由树模型处理 NaN。2014–2020 年华泰特征的整体有效率为 {availability:.2%}，完全缺分的列为 {absent}。
 
-三组均沿用基线的四个排序目标、树参数和种子 158。用 2014–2020 年数据拟合，用 2021 年分别早停。2022 年验证损失等于 1 减去四个目标、各交易日的平均 NDCG@50，数值越低，说明前 50 名越符合预设目标。2023–2025 年按同一规则扣费回测，该测试区间已在此前研究中多次查看。
+三组均沿用基线的四个排序目标、树参数和种子 158。用 2014–2020 年数据拟合，用 2021 年分别早停。{loss_period}验证损失等于 1 减去四个目标、各交易日的平均 NDCG@50，数值越低，说明前 50 名越符合预设目标。2023–2025 年按同一规则扣费回测，该测试区间已在此前研究中多次查看。
 
 **表　不同特征输入的验证排名质量与 2023–2025 年测试回测**
 
@@ -662,7 +666,9 @@ def write_six_grades(out: Path) -> Path:
     models = {"equal": "LightGBM", "xgb_equal": "XGBoost", "cat_equal": "CatBoost",
               "blend_equal": "双模型各半", "three_equal": "三模型各占⅓"}
     test = pd.read_parquet(out / "predictions.parquet", filters=[("split", "==", "test")])
-    validation = pd.read_csv(out / "validation_loss_daily.csv")
+    folded = (out / "fold_trials.csv").is_file()
+    validation = pd.read_csv(out / ("fold_trials.csv" if folded else "validation_loss_daily.csv"))
+    validation_period = "五个选参年等权评价" if folded else "2022 年验证"
     losses = validation.groupby(["strategy", "scheme"]).loss.mean().unstack()
     ic = pd.read_csv(out / "rank_ic_summary.csv").query("split == 'test' and year == 'all'").set_index("strategy")
     results, hits, returns, books = [], [], [], []
@@ -712,7 +718,7 @@ def write_six_grades(out: Path) -> Path:
 
 {markdown_table(["目标", "倒数50", "倒数51–100", "中间", "第51–100", "第26–50", "前25"], gain_rows)}
 
-沿用 MAD Alpha158、A–D 等权、种子 158、CatBoost L2={cfg["catboost"]["l2_leaf_reg"]} 和原五档各算法的树参数。2014–2020 年拟合，2021 年按各自目标早停，2022 年验证，2023–2025 年扣费回测。同一列验证损失均在相同股票、相同增益下计算，为 1 减去四个目标日均 NDCG@50。测试期已在历次研究中多次查看。
+沿用 MAD Alpha158、A–D 等权、种子 158、CatBoost L2={cfg["catboost"]["l2_leaf_reg"]} 和原五档各算法的树参数。2014–2020 年拟合，2021 年按各自目标早停，{validation_period}，2023–2025 年扣费回测。同一列验证损失均在相同股票、相同增益下计算，为 1 减去四个目标日均 NDCG@50。测试期已在历次研究中多次查看。
 
 **表　五档与六档训练：验证排序及测试期组合绩效**
 
@@ -794,9 +800,13 @@ def write_pair_tuning(out: Path) -> Path:
     months = pd.read_csv(out / "validation_monthly.csv")
     better_months = int((months.blend_equal < months.baseline).sum())
     title = "## 按等权组合验证损失逐步调参"
+    selection_period = ("按逐年扩展的训练窗重拟合，随后两年验证，各折损失等权。"
+                        if "walk_forward" in cfg else "2014–2020 年拟合，2021 年早停，2022 年验证。")
+    if "early_stop_years" in cfg.get("walk_forward", {}):
+        selection_period = "逐折扩展训练区间，在独立早停期确定轮数，再按随后选参期的组合损失跨折等权。清单见 fold_trials.csv。"
     return update_comparison_section(report, title, f"""{title}
 
-每类模型内部 A–D 等权，LightGBM 与 XGBoost 各占一半。采用原五档、MAD Alpha158、种子 158。2014–2020 年拟合，2021 年分别早停。2022 年在有完整标签的交易日上按四个目标的平均 NDCG@50 评价同一张混合排名，验证损失为 1 减去该均值。
+每类模型内部 A–D 等权，LightGBM 与 XGBoost 各占一半。采用原五档、MAD Alpha158、种子 158。{selection_period}在有完整标签的交易日上按四个目标的平均 NDCG@50 评价同一张混合排名，验证损失为 1 减去该均值。
 
 **表　逐阶段交叉比较两类模型的参数**
 
@@ -808,7 +818,7 @@ def write_pair_tuning(out: Path) -> Path:
 
 {performance}
 
-原双模型与新双模型的验证损失分别为 **{stages.before.iloc[0]:.6f}**、**{stages.loss.iloc[-1]:.6f}**。按月分开，调参后在 {len(months)} 个验证月中的 {better_months} 个月损失更低。测试期扣费累计收益从 **{old.total_return:.2%}** 变为 **{new.total_return:.2%}**，年化超额从 **{old.annualized_excess_return:.2%}** 变为 **{new.annualized_excess_return:.2%}**。2022 年被多个阶段重复用于选参，2023–2025 年也已在本项目的以往研究中查看。
+原双模型与新双模型的验证损失分别为 **{stages.before.iloc[0]:.6f}**、**{stages.loss.iloc[-1]:.6f}**。按最终模型的 2022 年验证结果分月，调参后在 {len(months)} 个验证月中的 {better_months} 个月损失更低。测试期扣费累计收益从 **{old.total_return:.2%}** 变为 **{new.total_return:.2%}**，年化超额从 **{old.annualized_excess_return:.2%}** 变为 **{new.annualized_excess_return:.2%}**。历史验证样本被多个阶段用于选参，2023–2025 年也已在本项目的以往研究中查看。
 
 ![等权组合调参前后的净值及累计超额收益]({links}/pair_tuning.png)
 
@@ -819,15 +829,19 @@ def write_pair_tuning(out: Path) -> Path:
 
 
 def write_expanding_pair(out: Path) -> Path:
-    """比较年度扩展训练与冻结基线的连续扣费账本、年度收益及选股结果。"""
+    """比较年度滚动训练与冻结基线的连续扣费账本、年度收益及选股结果。"""
     from src.report.charts import plot_rank_feature_paths
 
     cfg = json.loads((out / "config.json").read_text())
-    report = ROOT / "docs/results/expanding_pair_daily.md"
+    method = cfg["rolling_scheme"].removesuffix("_annual")
+    sliding = method == "sliding"
+    window = "滑动窗口" if sliding else "扩展窗口"
+    rule = "训练起点和终点各向后移一年" if sliding else "训练起点固定，终点每年延后一年"
+    report = ROOT / f"docs/results/{method}_pair_daily.md"
     links = os.path.relpath(out, report.parent)
-    names = {"expanding": "扩展训练", "fixed": "固定模型", "benchmark": "中证500"}
+    names = {method: window, "fixed": "固定模型", "benchmark": "中证500"}
     ledger = pd.read_parquet(out / "ledger.parquet")
-    plot_rank_feature_paths(out, ledger, {"expanding": "Expanding pair", "fixed": "Fixed pair"}, "nav_excess.png")
+    plot_rank_feature_paths(out, ledger, {method: f"{method.title()} pair", "fixed": "Fixed pair"}, "nav_excess.png")
     ic = pd.read_csv(out / "rank_ic_summary.csv").query("year == 'all'").set_index("strategy")
     losses = pd.read_csv(out / "test_ndcg_loss.csv").groupby("strategy").loss.mean()
     hits = pd.read_csv(out / "hits_daily.csv").groupby("strategy")[["hit50", "hit100", "bottom50", "bottom100"]].mean()
@@ -856,19 +870,19 @@ def write_expanding_pair(out: Path) -> Path:
         train, stop = bounds.loc["train"], bounds.loc["early_stop"]
         period_rows.append([year, f"{train.start} 至 {train.end}", str(stop.start)[:4], f"{train.stock_days:,}",
                             *[f"{row[name]:.2%}" for name in names]])
-    periods = markdown_table(["预测年", "训练信号区间", "早停年", "有效训练股票日", "扩展训练收益", "固定模型收益", "指数收益"], period_rows)
-    roll, fixed = summary.loc["expanding"], summary.loc["fixed"]
+    periods = markdown_table(["预测年", "训练信号区间", "早停年", "有效训练股票日", f"{window}收益", "固定模型收益", "指数收益"], period_rows)
+    roll, fixed = summary.loc[method], summary.loc["fixed"]
     n_sessions = ledger.trade_date.nunique()
-    n_evaluable = int(ic.loc["expanding", "n_days"])
-    return save_report(report, f"""# 中证500日频选股：固定起点的扩展窗口
+    n_evaluable = int(ic.loc[method, "n_days"])
+    return save_report(report, f"""# 中证500日频选股：{window}滚动训练
 
-扩展训练的扣费累计收益为 **{roll.total_return:.2%}**，固定模型为 **{fixed.total_return:.2%}**，相差 **{(roll.total_return-fixed.total_return)*100:+.2f} 个百分点**。两者日频选 50 只，沿用同一组已冻结的 LightGBM 和 XGBoost 参数、MAD Alpha158、交易规则及费率。
+{window}的扣费累计收益为 **{roll.total_return:.2%}**，固定模型为 **{fixed.total_return:.2%}**，相差 **{(roll.total_return-fixed.total_return)*100:+.2f} 个百分点**。两者日频选 50 只，沿用同一组已冻结的 LightGBM 和 XGBoost 参数、MAD Alpha158、交易规则及费率。
 
 **表　训练窗口与各自然年扣费收益**
 
 {periods}
 
-每年更新八个模型。训练起点固定，前一个完整自然年用于 NDCG@50 早停，仅使用在各自区间内已实现的收益标签。固定对照沿用 2021 年早停、2022 年验证选参的正式归档。2022 年也作为首个扩展窗口的早停年；更晚的窗口可使用已经结束的历史测试年份。全期持仓与资金跨年延续。
+每年更新八个模型。{rule}。前一个完整自然年用于 NDCG@50 早停，仅使用在各自区间内已实现的收益标签。固定对照沿用 2021 年早停、2022 年验证选参的正式归档。2022 年也作为首个窗口的早停年。更晚的窗口可使用已经结束的历史测试年份。全期持仓与资金跨年延续。
 
 **表　全期组合绩效**
 
@@ -882,7 +896,7 @@ def write_expanding_pair(out: Path) -> Path:
 
 每天将八个排序器各自的分数转成股票排名百分位，同类的四个目标各占 25%，两类树各占 50%。在 {n_evaluable} 个可评价交易日，每天从有真实收益的股票中取预测前 50 只，计算落入相应真实收益排名的比例。真实收益取 T+2 相对 T+1 的复权收盘涨幅，跨年但在测试期内的收益也计入。回测选股使用当天所有有效预测。2023–2025 年已在本项目此前的实验中观察。
 
-![扩展训练与固定模型的净值和累计超额收益]({links}/nav_excess.png)
+![{window}与固定模型的净值和累计超额收益]({links}/nav_excess.png)
 
 图 1　日频 offset 0。上图为策略扣费净值与中证500净值，下图为扣费日收益与指数日收益之差的逐日累加，包含所有测试交易日。
 

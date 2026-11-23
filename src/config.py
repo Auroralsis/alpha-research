@@ -11,6 +11,17 @@ ZSCORE_LABEL = "zscore"
 SAMPLING_RATES = {"subsample", "colsample_bytree"}
 
 
+def walk_forward_policy(settings: dict) -> dict:
+    """新选参任务采用研究配置的窗口，支持从旧的固定训练归档开始。"""
+    policy = settings.get("walk_forward")
+    if policy is None:
+        policy = json.loads(CONFIG_FILE.read_text())["walk_forward"]
+    if "early_stop_years" not in policy:
+        # 旧配置把早停和选参合称验证期。显式拆开两个年份。
+        policy = dict(policy, early_stop_years=1, validation_years=max(1, policy["validation_years"] - 1))
+    return policy
+
+
 def load_tuning(section: str, settings: dict, path: Path | None = None) -> dict | list:
     """仅在调参时读取候选，兼容旧实验配置内嵌的网格。"""
     if path is None:
@@ -36,7 +47,7 @@ def normalize_training_label(mode: str) -> str:
 
 def rebalance_frequency(days: int) -> tuple[str, str]:
     """根据调仓交易日数返回文件名后缀和中文研究频率。"""
-    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+    if type(days) is not int or days <= 0:
         raise ValueError("rebalance_days 必须是正整数")
     return {1: ("daily", "日频"), 5: ("weekly", "周频")}.get(days, (f"{days}d", f"{days}日调仓"))
 
@@ -78,40 +89,31 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
     if not 0 <= config["n_drop"] <= config["topk"] or config["topk"] <= 0:
         raise ValueError("持股数必须为正，且 0 <= n_drop <= topk")
     pairs = config.get("min_regression_pairs", 100)
-    if isinstance(pairs, bool) or not isinstance(pairs, int) or pairs < 2:
+    if type(pairs) is not int or pairs < 2:
         raise ValueError("min_regression_pairs 必须为不小于 2 的整数")
     if config["initial_capital_cny"] <= 0:
         raise ValueError("initial_capital_cny 必须为正")
     if config.get("buy_price", "vwap") not in ("vwap", "close"):
         raise ValueError("buy_price 必须为 vwap 或 close")
     limit = config.get("limit_threshold")
-    if limit is not None and (isinstance(limit, bool) or not 0 < limit < 1):
+    if limit is not None and not 0 < limit < 1:
         raise ValueError("limit_threshold 必须在 0 与 1 之间")
     if not 0 <= config.get("min_trade_cost_cny", 0) < float("inf"):
         raise ValueError("min_trade_cost_cny 必须为有限非负数")
     unit = config.get("trade_unit")
-    if unit is not None and (isinstance(unit, bool) or not isinstance(unit, int) or unit <= 0):
+    if unit is not None and (type(unit) is not int or unit <= 0):
         raise ValueError("trade_unit 必须为正整数或 null")
     for key in ("feature_workers", "feature_batch_size", "ridge_num_threads", "rolling_test_windows"):
         if key in config and (not isinstance(config[key], int) or config[key] <= 0):
             raise ValueError(f"{key} 必须为正整数")
-    model = config["lightgbm"]
-    for key in SAMPLING_RATES & model.keys():
-        if type(model[key]) not in (int, float) or not 0 < model[key] <= 1:
-            raise ValueError(f"single_lightgbm.params.{key} 必须在 (0, 1] 内")
-    freq = model.get("bagging_freq", model.get("subsample_freq", 0))
-    if type(freq) is not int or freq < 0:
-        raise ValueError("bagging_freq 必须是非负整数")
     if "lightgbm_tuning" in config:
-        validate_lightgbm_grid(config["lightgbm_tuning"], model)
+        validate_lightgbm_grid(config["lightgbm_tuning"], config["lightgbm"])
     return config
 
 
 def validate_lightgbm_grid(tuning: dict, model: dict) -> None:
     """在准备特征前校验 LightGBM 网格及各候选的取值范围。"""
-    if not isinstance(tuning, dict):
-        raise ValueError("lightgbm_tuning 必须为 JSON 对象")
-    space = tuning.get("search_space")
+    space = tuning["search_space"]
     supported = {"lambda_l1", "lambda_l2", "num_leaves", "learning_rate", "max_depth"} | SAMPLING_RATES
     if not isinstance(space, dict) or not space or not space.keys() <= supported & model.keys():
         raise ValueError("search_space 应选用 single_lightgbm.params 中已配置的参数，可选 " + "、".join(sorted(supported)))
@@ -119,10 +121,7 @@ def validate_lightgbm_grid(tuning: dict, model: dict) -> None:
         if not isinstance(values, list) or not values or any(
             type(v) not in (int, float) or not math.isfinite(v)
             or (key in SAMPLING_RATES and not 0 < v <= 1)
-            or (key != "max_depth" and v < 0)
-            or (key == "max_depth" and type(v) is not int)
-            or (key == "num_leaves" and (type(v) is not int or v < 2))
-            or (key == "learning_rate" and v <= 0) for v in values
+            for v in values
         ):
             raise ValueError(f"search_space.{key} 包含无效的候选值")
 

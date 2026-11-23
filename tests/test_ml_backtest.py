@@ -34,6 +34,46 @@ def write_feature_spec(out: Path) -> None:
 
 
 class TrainingTests(unittest.TestCase):
+    def test_walk_forward_windows_and_label_cutoffs(self):
+        from src.ml.walk_forward import folds, period
+
+        cfg = load_config()
+        windows = folds(cfg)
+        self.assertEqual(len(windows), 5)
+        for year, window in enumerate(windows, 2017):
+            self.assertEqual(window["train"], ["2014-01-02", f"{year-1}-12-31"])
+            self.assertEqual(window["early_stop"], [f"{year}-01-01", f"{year}-12-31"])
+            self.assertEqual(window["validation"], [f"{year+1}-01-01", f"{year+1}-12-31"])
+        frame = pd.DataFrame(dict(trade_date=pd.to_datetime(["2017-01-03", "2018-12-26", "2018-12-28"]),
+                                  label_end_date=pd.to_datetime(["2017-01-05", "2018-12-28", "2019-01-02"]),
+                                  ticker="stock", feature=[1., 2., 3.], label=[0.1, 0.2, 0.3]))
+        with TemporaryDirectory() as tmp:
+            frame.to_parquet(Path(tmp) / "features.parquet")
+            _, labels, _ = period(Path(tmp), windows[0]["validation"], ["feature"], dict(cfg, training_label="raw"), False)
+            _, stop_labels, _ = period(Path(tmp), windows[0]["early_stop"], ["feature"], dict(cfg, training_label="raw"), False)
+        np.testing.assert_array_equal(labels, [0.2])
+        np.testing.assert_array_equal(stop_labels, [0.1])
+
+    def test_eight_rankers_fit_only_train_and_early_stop(self):
+        from src.ml.walk_forward import BASES, fold_models, folds
+
+        cfg = load_config()
+        cfg["label_gains"] = cfg["four_model_targets"]
+        fold = folds(cfg)[0]
+        block = (pd.DataFrame({"feature": [1., 2.]}), np.array([0, 4]), np.array([2]))
+        for family in ("xgboost", "lightgbm"):
+            module = "xgb" if family == "xgboost" else "lgb"
+            matrix = "QuantileDMatrix" if family == "xgboost" else "Dataset"
+            with patch("src.ml.walk_forward.period", return_value=block) as reader, patch(
+                f"src.ml.walk_forward.{module}.{matrix}"
+            ), patch(f"src.ml.walk_forward.{module}.train") as fit:
+                fit.return_value.best_iteration = 2
+                models = list(fold_models(None, cfg, fold, family, {"nthread": 1}, ["feature"], True))
+            self.assertEqual([call.args[1] for call in reader.call_args_list], [fold["train"], fold["early_stop"]])
+            self.assertEqual([name for name, _, _ in models], list(BASES))
+            self.assertEqual(fit.call_count, 4)
+            self.assertEqual([n for _, _, n in models], [3 if family == "xgboost" else 2] * 4)
+
     def test_cli_selects_requested_model_and_retains_old_imports(self):
         from src.scripts.__main__ import main
         from src.scripts import boosting, run_catboost, run_listfold_mlp, run_xgboost
@@ -48,6 +88,27 @@ class TrainingTests(unittest.TestCase):
         with patch("src.scripts.run_all.main") as study:
             main(["lightgbm", "--workers", "2"])
             study.assert_called_once_with(["--workers", "2"], lightgbm_only=True)
+
+    def test_catrank_uses_same_day_average_ranks_and_preserves_unlabeled_stocks(self):
+        from unittest.mock import Mock
+        from src.scripts.catrank import cat_scores, merge_scores
+
+        frame = pd.DataFrame({
+            "trade_date": pd.to_datetime(["2020-01-02"]*4 + ["2020-01-03"]*2),
+            "ticker": ["d","c","a","b","a","d"],
+            "feature": [5,1,1,3,7,8],
+            "label": [float("nan"),0.1,0.2,0.3,0.4,0.5],
+        })
+        model = Mock()
+        model.predict.return_value = frame.feature.to_numpy()
+        model.get_param.return_value = 1
+        ranking = cat_scores(model, frame, ["feature"])
+        np.testing.assert_allclose(ranking.CatRank, [1,1/6,1/6,2/3,0,1])
+        other = merge_scores(frame,ranking.iloc[::-1])
+        pd.testing.assert_series_equal(other.label,frame.label)
+        pd.testing.assert_series_equal(other.CatRank,ranking.CatRank)
+        with self.assertRaisesRegex(ValueError,"缺 CatRank"):
+            merge_scores(frame, ranking.iloc[1:])
 
     def test_pair_tuning_keeps_incumbent_and_uses_effective_leaf_limits(self):
         from src.scripts.run_pair_tuning import candidates
@@ -67,6 +128,7 @@ class TrainingTests(unittest.TestCase):
         from src.scripts.run_xgboost import train
 
         cfg = load_config()
+        cfg.pop("walk_forward")  # 单验证期历史归档
         cfg.update(num_boost_round=4, early_stopping_rounds=2, label_gains=cfg["four_model_targets"])
         cfg["xgboost"].update(max_depth=2, nthread=1, reg_alpha=0, seed=cfg["seed"])
         periods, counts, frames = [], [], {}
@@ -345,6 +407,7 @@ class TrainingTests(unittest.TestCase):
         config = dict(load_config(), ridge_alpha=1, ridge_strong_alphas=[10, 100],
                       segments={name: [str(days[i].date()), str(days[i+5].date())]
                                 for name, i in (("train", 0), ("validation", 6), ("test", 12))})
+        config.pop("walk_forward")  # 验证旧实验的单窗选参和缺失标签行为
         rng = np.random.default_rng(15)
         panel = pd.DataFrame(rng.normal(size=(180, 158)).astype(np.float32), columns=FEATURE_NAMES)
         panel = panel.assign(trade_date=days.repeat(10), ticker=np.tile(list("ABCDEFGHIJ"), 18),
@@ -409,6 +472,7 @@ class TrainingTests(unittest.TestCase):
                       lightgbm=dict(objective="regression", metric="l2", lambda_l1=200., max_depth=8,
                                     colsample_bytree=1., subsample=1., bagging_freq=1,
                                     min_data_in_leaf=2, num_threads=1, verbosity=-1))
+        config.pop("walk_forward")  # 复核旧版 Optuna 单窗流程
         ticker = np.tile(np.arange(5), len(dates))
         frame = pd.DataFrame({name: (ticker + i).astype(np.float32) for i, name in enumerate(FEATURE_NAMES)}).assign(
             trade_date=dates.repeat(5), ticker=ticker.astype(str), label=ticker * .01,
@@ -581,6 +645,18 @@ class RollingWindowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "冻结树参数"):
             list(expanding_years({"train": ["2014-01-02", "2020-12-31"], "validation": ["2022-01-01", "2023-06-01"],
                                   "test": ["2023-04-03", "2025-08-20"]}))
+
+    def test_sliding_pair_advances_both_training_boundaries(self):
+        from src.scripts.run_pair_tuning import expanding_years
+
+        segments = {"train": ["2014-01-02", "2020-12-31"], "test": ["2023-01-01", "2025-12-31"]}
+        expanding = dict(expanding_years(segments))
+        sliding = dict(expanding_years(segments, sliding=True))
+        self.assertEqual(sliding[2023], expanding[2023])
+        for year in sliding:
+            self.assertEqual(sliding[year]["train"], [f"{year-9}-01-02", f"{year-2}-12-31"])
+            self.assertEqual(sliding[year]["early_stop"], expanding[year]["early_stop"])
+            self.assertEqual(sliding[year]["test"], expanding[year]["test"])
 
     def test_expanding_pair_purges_late_training_labels_and_scores_unlabeled_stocks(self):
         from src.ml.rank_validation import BASES

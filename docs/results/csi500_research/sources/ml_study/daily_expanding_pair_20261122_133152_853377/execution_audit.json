@@ -1,0 +1,25 @@
+{
+  "engine": "qlib.TopkDropoutStrategy",
+  "calendar_sessions": 727,
+  "quoted_tickers": 774,
+  "common_scored_stock_days": 363222,
+  "min_daily_candidates": 497,
+  "max_daily_candidates": 500,
+  "candidate_coverage": {
+    "expanding": {
+      "scored_stock_days": 363222,
+      "min_daily_candidates": 497,
+      "max_daily_candidates": 500
+    },
+    "fixed": {
+      "scored_stock_days": 363222,
+      "min_daily_candidates": 497,
+      "max_daily_candidates": 500
+    }
+  },
+  "buy_price": "close",
+  "limit_threshold": 0.095,
+  "min_trade_cost_cny": 5,
+  "trade_unit": 100,
+  "benchmark_uses_pre_close": true
+}

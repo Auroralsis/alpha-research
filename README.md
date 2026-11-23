@@ -109,7 +109,7 @@ python -B -m src.scripts rank-stack --equal-seed-from results/ml_study/daily_ran
 
 默认训练直接读取 `research.json` 的 `single_xgboost.params` 和公共种子、最大轮数、早停轮数。当前固定参数取自 2022 年双模型等权调参的优胜组合。[当次选定参数](results/ml_study/daily_pair_tuning_20261122_100328_550844/winners.json)
 
-运行 `python -B -m src.scripts xgboost --tune` 时，脚本从独立配置读取 `xgboost_tuning.search_space`，四组共享同一网格。2021 年早停，2022 年按两模型混合排名的验证损失选参，随后进行 2023–2025 年回测。可用 `--tuning-config 路径` 指定其他网格。导出的 `best_config.json` 可通过 `--config` 传回固定训练入口。[排序调参配置](configs/tuning.json)
+运行 `python -B -m src.scripts xgboost --tune` 时，脚本从独立配置读取 `xgboost_tuning.search_space`，四组共享同一网格。五折逐年扩展，各折训练后用下一年早停、再下一年评价两模型混合排名，按年度等权损失选参，随后进行 2023–2025 年回测。可用 `--tuning-config 路径` 指定其他网格。导出的 `best_config.json` 可通过 `--config` 传回固定训练入口。[排序调参配置](configs/tuning.json)
 
 Qlib 0.9.7 的 `XGBModel.fit()` 创建训练矩阵时只传特征、标签和样本权重。本项目通过 XGBoost 的 `group` 显式传入每日截面大小，让同一天的股票互相比较；IC 评价和组合回测共用 Qlib。[Qlib XGBModel 源码](https://github.com/microsoft/qlib/blob/v0.9.7/qlib/contrib/model/xgboost.py)
 
@@ -119,9 +119,9 @@ Qlib 0.9.7 的 `XGBModel.fit()` 创建训练矩阵时只传特征、标签和样
 
 ### LightGBM 与 XGBoost 等权组合调参
 
-`python -B -m src.scripts pair-tuning` 从已归档的五档双模型基线开始，按 `configs/tuning.json` 中的 `rank_pair_tuning` 逐阶段搜索。每一步在验证期交叉组合两类模型，比较 1 − NDCG@50，保留上一阶段的优胜者。每类模型内部四目标等权。2014–2020 年拟合，2021 年早停，2022 年选参，最终才读取测试期评价。可用 `--reference` 指定基线、`--tuning-config` 指定网格，或用 `--resume 实验目录` 从当次配置接续运行。输出的 `best_config.json` 分别更新四模型排序 LightGBM 和 XGBoost 的参数。候选与逐阶段结果见 `trials.csv` 和 `stages.csv`。
+`python -B -m src.scripts pair-tuning` 从已归档的五档双模型基线开始，按 `configs/tuning.json` 中的 `rank_pair_tuning` 逐阶段搜索。每一步在验证期交叉组合两类模型，比较 1 − NDCG@50，保留上一阶段的优胜者。每类模型内部四目标等权。默认五折从 2014–2016 年拟合、2017 年早停、2018 年选参开始，每次将训练终点、早停年、选参年推进一年，最后一折在 2022 年选参。每个候选按五个选参年的平均组合损失比较，逐折明细见 `fold_trials.csv`。参数冻结后评价测试期。可用 `--reference` 指定基线、`--tuning-config` 指定网格，或用 `--resume 实验目录` 从当次配置接续运行。输出的 `best_config.json` 分别更新四模型排序 LightGBM 和 XGBoost 的参数。候选与逐阶段结果见 `trials.csv` 和 `stages.csv`。
 
-`python -B -m src.scripts rolling-pair` 用最近一次已完成的联合调参归档，按自然年重训四个 LightGBM 和四个 XGBoost。训练起点固定为归档的起始日，每年用上一整年早停，八列分数合成后拼接为连续的日频 Top-50 回测。可用 `--reference 实验目录` 指定固定对照，或用 `--resume 实验目录` 接续本次模型。报告在 [扩展窗口与固定模型对照](docs/results/expanding_pair_daily.md)。
+`python -B -m src.scripts rolling-pair` 用最近一次已完成的联合调参归档，按自然年重训四个 LightGBM 和四个 XGBoost。默认使用固定起点的扩展窗口（expanding window）。加上 `--window sliding` 使用滑动窗口，训练年数与首窗一致，起点和终点每年同时后移。两者均用上一整年早停，跨年连续运行日频 Top-50 回测。可用 `--reference 实验目录` 指定固定对照，或用 `--resume 实验目录` 接续本次模型。参见[扩展窗口](docs/results/expanding_pair_daily.md)和[滑动窗口](docs/results/sliding_pair_daily.md)的回测结果。
 
 
 ### ListFold 打分模型
@@ -140,13 +140,13 @@ MLP 默认使用 CUDA，训练、早停和预测按批次送入显卡。启动�
 
 当前网格固定树深 3、学习率 0.05，用 16 个 CPU 线程比较 L2 正则 100、300、1000。候选值在 `tuning.json` 的 `catboost_tuning.search_space`，单次训练参数在 `single_catboost.params`。本实验在每类模型内对四个目标等权，不读取另一项权重对照实验的 `four_model_weights`。
 
-两个阶段的调参均用 2022 年验证损失。先产生一份混合排名，对 A–D 的真实增益分别计算 NDCG@50，然后对目标和交易日取平均，用 1 减去该均值得到损失。每次实验的 `blend_trials.csv` 给出原组合损失、新模型四组等权损失、混合损失和变化量；测试集只评价冻结后的参数。[综合报告中的研究结论](docs/results/lightgbm_xgboost_nav_daily.md)
+XGBoost 和 CatBoost 的候选均按 2018 至 2022 年五个选参年的平均损失比较。先产生一份混合排名，对 A–D 的真实增益分别计算 NDCG@50，然后对目标和交易日取平均，用 1 减去该均值得到损失。每次实验的 `blend_trials.csv` 给出原组合损失、新模型四组等权损失、混合损失和变化量；测试集只评价冻结后的参数。[综合报告中的研究结论](docs/results/lightgbm_xgboost_nav_daily.md)
 
 ### 方向统一的等权 Alpha158
 
 `python -B -m src.scripts equal-weight` 读取同一调仓频率最近一次中性化比较的特征缓存。也可用 `--source 实验目录` 指定来源。方向按训练期日均 Rank IC 确定，要求超过半数训练年份同号。按日计算方向统一的百分位，在公式家族内和家族间分别等权。报告写入 `docs/results/alpha158_equal_weight_<频率>.md`，每列方向记录在新实验的 `directions.csv`。
 
-加 `--ridge` 会在同一份中性化特征上比较 `ridge_strong_alphas` 的各档 L2 惩罚，以验证 MSE 选强正则候选，再与等权组合一起回测。新报告为 `docs/results/alpha158_ridge_comparison_<频率>.md`，实验目录保存逐候选指标和验证集最优的 Ridge 模型。
+加 `--ridge` 会在同一份中性化特征上比较 `ridge_strong_alphas` 的各档 L2 惩罚，以五折平均 MSE 选强正则候选，每折单独拟合缺失值处理和标准化，再与等权组合一起回测。新报告为 `docs/results/alpha158_ridge_comparison_<频率>.md`，实验目录保存逐候选指标和验证集最优的 Ridge 模型。
 
 ### LightGBM 验证集调参
 
@@ -154,11 +154,11 @@ MLP 默认使用 CUDA，训练、早停和预测按批次送入显卡。启动�
 python -B -m src.scripts study --stage tune
 ```
 
-先用原配置训练基线，再用 Optuna 的 `GridSampler` 跑完 `tuning.json` 的 `lightgbm_tuning.search_space` 里的每组候选。候选总数等于各参数去重后的取值个数相乘，另加一次基线训练。每组用 Qlib 的 `DatasetH` 和 `LGBModel.fit()` 在训练期拟合，用验证期 MSE 早停并选参，同时记录验证期 Rank IC 和 Rank ICIR。固定窗口选出的参数可以给固定和滚动 LightGBM 共用。
+先用原配置训练基线，再用 Optuna 的 `GridSampler` 跑完 `tuning.json` 的 `lightgbm_tuning.search_space` 里的每组候选。候选总数等于各参数去重后的取值个数相乘，另加基线候选。每折用独立的下一年按 MSE 早停，随后一年计算选参 MSE。五折等权选择树参数，最终模型按固定模型的训练和早停配置拟合。固定和滚动 LightGBM 都可使用选出的参数。
 
 默认单独比较采样强度，固定树结构、学习率与 L1/L2。当前 MAD 基线学习率为 0.02554240953288225，树深为 5，每轮使用 50% 的特征和 80% 的训练行。网格交叉比较列采样率 `colsample_bytree` 的 0.5、0.7 与行采样率 `subsample` 的 1.0、0.8，共四个候选。行指股票日样本，`single_lightgbm.params.bagging_freq=1` 表示每轮重新抽样，`subsample=1.0` 使用全部行。只调列时可从 `search_space` 移除 `subsample`，固定值取自 `single_lightgbm.params`。树深、叶子数、L1/L2 和学习率仍可加入同一网格。
 
-每次 LightGBM 拟合结束后输出一行，包含训练和验证的 Mean Rank IC、MSE 与最佳轮数。两组指标都取验证 MSE 最低的同一轮，Mean Rank IC 按交易日计算 Spearman 相关系数后取平均。调参摘要写入 `trials.csv`。固定和滚动训练的 Mean Rank IC 写入各自的 `training_log.json`，逐轮 MSE 见 `training_mse.csv`。
+最终模型拟合结束后输出一行，包含训练和验证的 Mean Rank IC、MSE 与最佳轮数。两组指标都取验证 MSE 最低的同一轮，Mean Rank IC 按交易日计算 Spearman 相关系数后取平均。调参摘要写入 `trials.csv`，每折的区间、最佳轮数和选参 MSE 写入 `fold_trials.csv`。固定和滚动训练的 Mean Rank IC 写入各自的 `training_log.json`，逐轮 MSE 见 `training_mse.csv`。
 
 调参产物默认放在 `results/ml_study/tuning_<时间戳>/`。`trials.csv` 保存基线和每次候选的指标，`optuna.sqlite3` 保存 Optuna 试验，`best_config.json` 是完整的研究配置，`lightgbm.txt` 和 `best_training_mse.csv` 保存验证 MSE 最佳模型及损失曲线。用 `python -B -m src.scripts lightgbm --config 调参目录/best_config.json` 只跑固定 LightGBM，或用 `run_all` 跑完整研究。
 

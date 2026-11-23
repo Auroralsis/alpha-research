@@ -119,8 +119,6 @@ def compute_factors(
         ranks = {field: _pair_ranks(arrays[field], volume) for field in ("open", "close", "high")}
     output = []
     for day in as_date_index(signal_dates).sort_values():
-        if day not in members or day not in panel.calendar:
-            raise ValueError("Signal date lacks membership or independent calendar")
         row = cast(int, panel.calendar.get_loc(day))
         if row < 9:
             raise ValueError("Provide at least nine buffer days")

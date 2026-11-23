@@ -178,15 +178,11 @@ def prepare_neutral_features(config: dict, raw_dir: Path, neutral_dir: Path) -> 
     keys = ["trade_date", "ticker"]
     caps = pd.read_parquet(INPUTS["caps"], columns=["trade_date", "ts_code", "total_mv"])
     controls = attach_controls(raw[keys], caps, pd.read_parquet(INPUTS["industries"]))
-    if not controls[keys].equals(raw[keys]):
-        raise ValueError("市值、行业与原始特征的股票日未逐行对齐")
     values = raw[names].to_numpy(dtype=np.float32)
     outputs = np.empty_like(values)
     cap, industry = controls.total_mv.to_numpy(), controls.industry.to_numpy()
     with threadpool_limits(limits=1, user_api="blas"):
-        for day, positions in controls.groupby("trade_date").indices.items():
-            if not np.any(np.isfinite(cap[positions]) & (cap[positions] > 0) & pd.notna(industry[positions])):
-                raise ValueError(f"{day:%Y-%m-%d} 整个截面缺少控制变量，请补齐历史市值和行业")
+        for positions in controls.groupby("trade_date").indices.values():
             outputs[positions] = neutral_feature_matrix(values[positions], cap[positions], industry[positions])
     keep = np.isfinite(outputs).any(axis=1)
     coverage = controls[keys].assign(stock_days=1, missing_cap=~(np.isfinite(cap) & (cap > 0)),

@@ -157,9 +157,6 @@ def run_blend(source: Path) -> Path:
 def run_equal_seed(reference: Path, seed: int) -> Path:
     """只更换基础模型种子，训练四个排名模型并与存档等权预测配对回测。"""
     cfg = json.loads((reference / "config.json").read_text())
-    old_seed = cfg["seed"]
-    if seed == old_seed:
-        raise ValueError("对照实验需要不同的种子")
     cfg["seed"] = cfg["lightgbm"]["seed"] = seed
     cfg["equal_reference"] = str(reference.resolve())
     out = new_run(cfg["rebalance_days"], tag=f"equal_seed_{seed}")
@@ -285,11 +282,13 @@ def main(argv=None):
 SIX_GRADE_METHODS = ("equal", "xgb_equal", "cat_equal", "blend_equal", "three_equal")
 
 
-def train_six_grades(reference: Path, targets: dict) -> Path:
+def train_six_grades(reference: Path, targets: dict, policy=None) -> Path:
     """按原模型的树参数、股票日、早停年和交易配置训练十二个六档排序器。"""
     from src.scripts.boosting import fit_catboost, train_xgboost
 
     cfg = json.loads((reference / "config.json").read_text())
+    if policy is not None:
+        cfg["walk_forward"] = policy
     old_final = Path(cfg["reference"]) / "final"
     out = new_run(cfg["rebalance_days"], tag="six_grades")
     if set(targets) != set(BASES) or any(len(g) != 6 or g != sorted(g) or g[0] < 0 or
@@ -306,6 +305,8 @@ def train_six_grades(reference: Path, targets: dict) -> Path:
     print(out, flush=True)
     source = Path(cfg["feature_source"])
     names = alpha158_columns(source)
+    if cfg.get("walk_forward", {}).get("early_stop_years"):
+        compare_grade_folds(out, cfg)
     train_fold(source, cfg, names, cfg["final_early_stop_year"], BASES, out / "final")
     # 前两期的股票日与原实验逐日一致；合并六档中的 4、5 应能精确还原原五档人数。
     counts = pd.read_csv(out / "final/grade_counts.csv")
@@ -315,6 +316,31 @@ def train_six_grades(reference: Path, targets: dict) -> Path:
     train_xgboost(out, cfg.copy(), source, names, out)
     fit_catboost(cfg, source, names, out, tune=False)
     return out
+
+
+def compare_grade_folds(out, cfg):
+    """每种训练标签都用独立年份预测，并按相同的五档和六档目标评价。"""
+    from src.ml.walk_forward import rank_predictions
+
+    options = {family: [cfg[family]] for family in ("lightgbm", "xgboost", "catboost")}
+    records = []
+    for size, prefix in ((5, "old_"), (6, "")):
+        settings = dict(cfg, split_top25=size == 6, label_gains=cfg["five_grade_targets"] if size == 5 else cfg["label_gains"])
+        for fold, keys, ranks in rank_predictions(out / str(size), settings, options):
+            frame = read_period(Path(cfg["feature_source"]), fold["validation"], split_top25=True)
+            pd.testing.assert_frame_equal(keys[["trade_date", "ticker"]], frame[["trade_date", "ticker"]])
+            scores = dict(zip(SIX_GRADE_METHODS[:3], (ranks[f][0] for f in options)))
+            xw = cfg["lightgbm_xgboost_blend"]["xgboost_weight"]
+            cw = cfg["catboost_four_equal"]["catboost_weight"]
+            scores["blend_equal"] = (1 - xw) * scores["equal"] + xw * scores["xgb_equal"]
+            scores["three_equal"] = (1 - cw) * scores["blend_equal"] + cw * scores["cat_equal"]
+            for scheme, gains in ((5, cfg["five_grade_targets"]), (6, cfg["label_gains"])):
+                labels = frame[["trade_date", "ticker", "grade", "evaluable"]].copy()
+                labels["grade"] = labels.grade.clip(upper=scheme - 1)
+                for name, score in scores.items():
+                    loss = validation_loss(labels, score, gains, cfg["topk"]).loss.mean()
+                    records.append(dict(strategy=prefix + name, scheme=scheme, valid_start=fold["validation"][0], loss=loss))
+    pd.DataFrame(records).to_csv(out / "fold_trials.csv", index=False)
 
 
 def evaluate_six_grades(out: Path) -> Path:
@@ -377,7 +403,8 @@ def six_grades_main(argv=None):
         directory = args.evaluate.resolve()
     else:
         ref = args.reference or latest_run("trial_0/top50.cbm", "blend_trials.csv", "validation_losses.csv", "ledger.parquet", rebalance_days=1)
-        directory = train_six_grades(ref.resolve(), json.loads(args.config.read_text())["six_grade_targets"])
+        settings = load_config(args.config)
+        directory = train_six_grades(ref.resolve(), settings["six_grade_targets"], settings.get("walk_forward"))
     print(evaluate_six_grades(directory), flush=True)
 
 

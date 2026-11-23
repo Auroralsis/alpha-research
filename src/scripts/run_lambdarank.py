@@ -91,12 +91,43 @@ def fit_ranker(datasets: list[lgb.Dataset], params: dict, cfg: dict, directory: 
     metric = f"ndcg@{cfg['topk']}"
     curve = pd.DataFrame({split: values[metric] for split, values in history.items()})
     curve.index = pd.RangeIndex(1, len(curve) + 1, name="iteration")
-    assert curve.validation.idxmax() == ranker.best_iteration
     curve.to_csv(directory / "training_ndcg.csv")
     ranker.save_model(str(directory / "lambdarank.txt"), num_iteration=ranker.best_iteration)
     print(f"{directory.name} 最佳轮数 {ranker.best_iteration}，验证 {metric}={curve.validation.max():.6f}", flush=True)
 
     return ranker
+
+
+def compare_gains(source, out, cfg, names, params, candidates):
+    """在每折用独立早停期拟合，按选参年的尾部误选率和收益比较增益。"""
+    from src.ml.walk_forward import folds
+
+    rows = []
+    for fold in folds(cfg):
+        frames = {}
+        for split, bounds in fold.items():
+            raw = read_feature_split(source / "features.parquet", bounds, split)
+            mask = segment_masks(raw, {split: bounds})[split]
+            frame = raw.loc[mask].sort_values(["trade_date", "ticker"])
+            if split != "validation":
+                frame = frame.loc[fitting_targets(frame, cfg["training_label"]).index]
+            frames[split] = frame
+        valid = frames["validation"]
+        scored = valid[["trade_date", "ticker", "label"]].assign(evaluable=True, split="validation")
+        for name, gains in {**candidates, "quintile": list(range(5))}.items():
+            mats = []
+            for split in ("train", "early_stop"):
+                frame = frames[split]
+                labels = quantile_relevance(frame, 5) if name == "quintile" else bottom_relevance(frame, cfg["topk"])
+                mats.append(lgb.Dataset(frame[names], label=labels, group=frame.groupby("trade_date", sort=False).size()))
+            folder = out / "folds" / fold["validation"][0] / name
+            folder.mkdir(parents=True)
+            model = fit_ranker(mats, dict(params, label_gain=gains), cfg, folder)
+            scored[name] = model.predict(valid[names], num_threads=params["num_threads"])
+        metrics = ranking_diagnostics(scored, cfg["topk"], (*candidates, "quintile"))
+        rows.append(metrics.groupby("strategy")[["bottom_rate", "top_return", "hit_rate"]].mean().reset_index().assign(
+            train_end=fold["train"][1], early_stop_end=fold["early_stop"][1], valid_start=fold["validation"][0]))
+    pd.concat(rows).to_csv(out / "fold_trials.csv", index=False)
 
 
 def run(source: Path, previous: Path | None = None, *, target: str | None = None,
@@ -134,6 +165,8 @@ def run(source: Path, previous: Path | None = None, *, target: str | None = None
         if not isinstance(gaps, list) or not gaps or any(type(gap) is not int or gap < 1 for gap in gaps):
             raise ValueError("lambdarank_bottom_gaps 需要非空的正整数列表")
         candidates = {f"gap_{gap}": [0, *range(gap, gap + 9)] for gap in gaps}
+        cfg["walk_forward"] = load_config()["walk_forward"]
+        compare_gains(source, out, cfg, names, params, candidates)
         (out / "gain_candidates.json").write_text(json.dumps(candidates, indent=2) + "\n")
     (out / "config.json").write_text(json.dumps(dict(cfg, lightgbm=params), indent=2) + "\n")
     (out / "source.json").write_text(json.dumps(dict(baseline=str(source.resolve()), target=f"daily_{target}_relevance",

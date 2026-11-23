@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import CONFIG_FILE, load_config, load_tuning, rebalance_frequency, validate_lightgbm_grid
+from src.config import CONFIG_FILE, load_config, load_tuning, rebalance_frequency, validate_lightgbm_grid, walk_forward_policy
 from src.data.download import save_parquet
 from src.data.research_panel import (
     CSI500_INPUTS as INPUTS, ROOT, ResearchPanel, load_market_calendar, prepare_inputs,
@@ -92,6 +92,8 @@ def evaluate_predictions(config: dict, config_path: Path, out: Path, dates: pd.D
 
     evaluation = scores.loc[scores.split.isin(("validation", "test"))]
     test = evaluation.loc[evaluation.split.eq("test")]
+    
+    # 评估分数与未来收益的关系，如计算RankIC等
     daily = prediction_diagnostics(evaluation, config, dates, out,
                                    strategies_by_split={"validation": validation, "test": strategies})
     run_backtests(INPUTS, config, test_dates, test, panel, out, strategies=strategies)
@@ -123,6 +125,7 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
         days = load_config(args.config or CONFIG_FILE)["rebalance_days"]
         out = latest_run("manifest.json", "windows.json", rebalance_days=days)
     config_path = args.config or (out / "config.json" if evaluate and out is not None else CONFIG_FILE)
+    # 加载研究配置，确定输出目录等
     config = load_config(config_path)
     if out is None:
         out = new_run(tag="tuning") if tuning else new_run(config["rebalance_days"], tag="lightgbm" if lightgbm_only else "")
@@ -141,6 +144,7 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
         if tuning:
             from src.ml.tuning import tune_lightgbm
 
+            config["walk_forward"] = walk_forward_policy(config)
             config["lightgbm_tuning"] = load_tuning("lightgbm_tuning", config, args.tuning_config)
             validate_lightgbm_grid(config["lightgbm_tuning"], config["lightgbm"])
         out.mkdir(parents=True, exist_ok=True)
@@ -148,6 +152,7 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
             parser.error("新实验需要空目录，请选择其他 --out")
         print(f"本次实验目录 {out}", flush=True)
         neutral = config.get("alpha158_processing") == "neutral"
+        # 检查交易日历、历史成分股、行情和行业数据，返回交易日历
         dates = prepare_inputs(config, need_industry=neutral or not (tuning or lightgbm_only))
         if neutral:
             from src.data.download import download_caps
@@ -156,6 +161,7 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
         through = config["segments"]["validation"][1] if tuning else None
         from src.ml.dataset import prepare_features
 
+        # 生成训练表，计算每一个交易日的alpha158和未来收益标签
         prepare_features(config, dates, out, workers, through=through)
         if tuning:
             (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -165,13 +171,18 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
             return
         from src.ml.models import train_and_predict
 
+        # 用生成的训练表训练固定的lightGBM(MSE)和Ridge
         predictions = train_and_predict(config, out, include_ridge=not lightgbm_only)
         if not lightgbm_only:
             from src.ml.rolling import merge_rolling_predictions, train_rolling
 
+            # 训练 Rolling lightGBM，给各自的测试窗口打分
             rolling = train_rolling(config, dates, out)
             windows = json.loads((out / "windows.json").read_text())["windows"]
             predictions = merge_rolling_predictions(predictions, rolling, windows)
+    # 接手预测表，此时内部有固定LightGBM(MSE)，Rolling LightGBM(MSE)，Ridge(MSE) 三类
+    # 补充alpha3,13,44三种传统因子分数，经过了行业、市值中性化，再按照日期和股票代码合并 
+    # 这里最后有六种方法计算出的测试集分数
     report = evaluate_predictions(config, config_path, out, dates, predictions, lightgbm_only=lightgbm_only)
     if not evaluate:
         (out / "features.parquet").unlink()

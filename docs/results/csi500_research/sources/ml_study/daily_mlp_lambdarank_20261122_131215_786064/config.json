@@ -1,0 +1,203 @@
+{
+  "qlib_version": "0.9.7",
+  "segments": {
+    "train": [
+      "2014-01-02",
+      "2020-12-31"
+    ],
+    "validation": [
+      "2022-01-01",
+      "2022-12-31"
+    ],
+    "test": [
+      "2023-01-01",
+      "2025-12-31"
+    ]
+  },
+  "feature_warmup_days": 60,
+  "label_start_days": 1,
+  "label_end_days": 2,
+  "seed": 158,
+  "training_label": "zscore",
+  "ridge_loss": "mse",
+  "ridge_alpha": 100.0,
+  "lightgbm": {
+    "learning_rate": 0.02554240953288225,
+    "max_depth": 5,
+    "num_leaves": 117,
+    "colsample_bytree": 0.5,
+    "subsample": 0.8,
+    "lambda_l1": 7.430068914643599,
+    "lambda_l2": 3.0313549368752515,
+    "num_threads": 16,
+    "verbosity": -1,
+    "min_data_in_leaf": 84,
+    "bagging_freq": 1,
+    "seed": 158,
+    "objective": "ListFold-exp",
+    "metric": "listfold_nll_per_pair"
+  },
+  "num_boost_round": 1000,
+  "early_stopping_rounds": 50,
+  "lightgbm_tuning": {
+    "search_space": {
+      "colsample_bytree": [
+        0.5,
+        0.7
+      ],
+      "subsample": [
+        1.0,
+        0.8
+      ]
+    }
+  },
+  "topk": 50,
+  "n_drop": 5,
+  "min_regression_pairs": 100,
+  "rebalance_days": 1,
+  "buy_price": "close",
+  "buy_fee_bps": 5,
+  "sell_fee_bps": 15,
+  "min_trade_cost_cny": 5,
+  "limit_threshold": 0.095,
+  "trade_unit": 100,
+  "initial_capital_cny": 100000000,
+  "feature_workers": 6,
+  "ridge_num_threads": 4,
+  "rolling_test_windows": 3,
+  "log_evaluation_period": 0,
+  "data": {
+    "start_date": "20130901",
+    "end_date": "20251231",
+    "market_end_date": "20260228",
+    "request_interval": 0.4
+  },
+  "ridge_solver": "cholesky",
+  "feature_batch_size": 64,
+  "neutral_search": {
+    "baseline_run": "daily_20261121_092926_223980",
+    "tree_shapes": [
+      [
+        3,
+        7
+      ],
+      [
+        5,
+        15
+      ],
+      [
+        7,
+        31
+      ],
+      [
+        9,
+        127
+      ]
+    ],
+    "leaf_sizes": [
+      50,
+      250,
+      1000
+    ],
+    "structure_regularization": [
+      10,
+      100
+    ],
+    "lambda_l1": [
+      0,
+      30,
+      300
+    ],
+    "lambda_l2": [
+      0,
+      100,
+      1000
+    ],
+    "retained_structures": 2,
+    "fine_region_top": 5,
+    "fine_trials": 30,
+    "fine_learning_rate": [
+      0.02,
+      0.1
+    ]
+  },
+  "alpha158_processing": "mad",
+  "label_gains": {
+    "top50": [
+      0,
+      1,
+      2,
+      3,
+      9
+    ],
+    "top100": [
+      0,
+      1,
+      2,
+      8,
+      9
+    ],
+    "avoid50": [
+      0,
+      6,
+      7,
+      8,
+      9
+    ],
+    "avoid100": [
+      0,
+      1,
+      7,
+      8,
+      9
+    ]
+  },
+  "oof_years": [
+    2018,
+    2019,
+    2020
+  ],
+  "final_early_stop_year": 2021,
+  "stack_C": 1.0,
+  "feature_source": "/home/lxy/quant/alpha-research/results/ml_study/daily_alpha158_comparison_20261121_105840_864298/preprocessing_test/sampling_mse",
+  "historical_reference": "/home/lxy/quant/alpha-research/results/ml_study/daily_lambdarank_quintile_gap3_20261121_155554_734020",
+  "listfold_reference": "/home/lxy/quant/alpha-research/results/ml_study/daily_rank_stack_20261121_160245_719888",
+  "lightgbm_version": "4.6.0",
+  "listfold_spec": "完整截面，真实收益降序、同收益按股票代码；奇数时中间股票留在分母直至结束",
+  "listfold_mlp": {
+    "device": "cuda",
+    "hidden_sizes": [
+      256,
+      512,
+      128,
+      32
+    ],
+    "learning_rate": 0.001,
+    "batch_days": 8,
+    "updates": 1000,
+    "evaluate_every": 100,
+    "cpu_threads": 16
+  },
+  "tree_reference": "/home/lxy/quant/alpha-research/results/ml_study/daily_lightgbm_listfold_20261122_113549_508288",
+  "torch_version": "2.9.1+cu128",
+  "optimizer": "Adam",
+  "activations": "ReLU including output",
+  "preprocessing": "train median imputation, train min-max scaling and clipping",
+  "objective": "lambdarank",
+  "device": "cuda",
+  "device_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "ndcg_at": 50,
+  "truncation": 53,
+  "lambdarank_norm": true,
+  "sigmoid": 1.0,
+  "pair_reference": "/home/lxy/quant/alpha-research/results/ml_study/daily_pair_tuning_20261122_100328_550844",
+  "mlp_reference": "/home/lxy/quant/alpha-research/results/ml_study/daily_mlp_listfold_20261122_125552_337530",
+  "architecture": [
+    158,
+    256,
+    512,
+    128,
+    32,
+    1
+  ]
+}
