@@ -18,7 +18,7 @@ def regression_output(values, dates, mode):
 
 
 def fit_scale(x, names):
-    """只在训练样本上拟合每列的填充值与缩放范围。无训练观测的列保持零输入。"""
+    """只在训练样本上拟合每列的填充值与缩放范围。无训练观测的列以零填补缺失值。"""
     stats = []
     for col in x.T:
         if np.isinf(col).any():
@@ -28,8 +28,8 @@ def fit_scale(x, names):
     return pd.DataFrame(stats, columns=["count", "min", "median", "max"], index=pd.Index(names, name="feature"))
 
 
-def transform(values, stats, scaling="minmax"):
-    """使用训练期统计量填补、截尾并缩放特征。"""
+def transform(values, stats, scaling="none"):
+    """默认用训练期中位数填补缺失值，显式选择 minmax 时再截尾和缩放。"""
     import torch
 
     x = np.ascontiguousarray(values, dtype=np.float32).copy()
@@ -86,7 +86,7 @@ def ndcg_day(scores, gains, cutoff, truncation, *, evaluate=False):
     return (weight * softplus(-margin)).sum()
 
 
-def mlp_periods(sections, names, out, *, ranking, scaling="minmax", regression_mode="raw"):
+def mlp_periods(sections, names, out, *, ranking, scaling="none", regression_mode="raw"):
     """只用训练期拟合缩放统计，按交易日和股票代码对齐标签。"""
     import torch
 
@@ -114,7 +114,7 @@ def mlp_periods(sections, names, out, *, ranking, scaling="minmax", regression_m
 def fit_mlp(sections, names, cfg, out):
     """共用按日训练和早停流程；四个排序目标独立保存权重。"""
     ranking = cfg["objective"] == "lambdarank"
-    periods = mlp_periods(sections, names, out, ranking=ranking, scaling=cfg.get("mlp_input_scaling", "minmax"),
+    periods = mlp_periods(sections, names, out, ranking=ranking, scaling=cfg.get("mlp_input_scaling", cfg["mlp"].get("input_scaling", "none")),
                           regression_mode=cfg["mlp"].get("regression_output", "raw"))
     targets = cfg["label_gains"] if ranking else {"mlp": None}
     models = {}
@@ -129,7 +129,7 @@ def mlp_predictor(models, names, cfg, out):
     """用冻结网络和训练期缩放统计对所有股票打分。"""
     import torch
 
-    scaling = cfg.get("mlp_input_scaling", "minmax")
+    scaling = cfg.get("mlp_input_scaling", cfg["mlp"].get("input_scaling", "none"))
     daily_zscore = scaling == "daily_zscore"
     stats = None if daily_zscore else pd.read_csv(out / "preprocessing.csv", index_col="feature", float_precision="round_trip").loc[names]
 

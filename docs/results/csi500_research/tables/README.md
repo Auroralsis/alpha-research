@@ -1,6 +1,6 @@
 # 中证500日频选股研究表格数据
 
-每个 CSV 对应报告中的一张表，行列顺序与报告一致。标有（%）的列按百分数保存，例如 27.30 表示 27.30%。换手单位为倍，手续费单位为万元。空单元格对应报告中的“—”。文件采用 UTF-8 BOM 编码，可直接用 Excel 打开。
+表 1 至表 5 的 CSV 按报告中的行列顺序排列。滚动训练的逐年明细附在末尾。标有（%）的列按百分数保存，例如 27.30 表示 27.30%。换手单位为倍，手续费单位为万元。空单元格对应报告中的“—”。文件采用 UTF-8 BOM 编码，可直接用 Excel 打开。
 
 ## 表 1　三个单因子处理前后的单日收益预测及扣费回测
 
@@ -33,9 +33,24 @@
 - [ml_study/daily_pair_tuning_20261122_100328_550844/predictions.parquet](../sources/ml_study/daily_pair_tuning_20261122_100328_550844/predictions.parquet)
 - [ml_study/daily_expanding_pair_20261122_133152_853377/predictions.parquet](../sources/ml_study/daily_expanding_pair_20261122_133152_853377/predictions.parquet)
 - [ml_study/daily_sliding_pair_20261122_150725_707868/predictions.parquet](../sources/ml_study/daily_sliding_pair_20261122_150725_707868/predictions.parquet)
-- [ml_study/daily_mlp_lambdarank_20261122_131215_786064/hits_summary.csv](../sources/ml_study/daily_mlp_lambdarank_20261122_131215_786064/hits_summary.csv)
+- [ml_study/mlp_report_median_20261126/hits_summary.csv](../sources/ml_study/mlp_report_median_20261126/hits_summary.csv)
 
-## 表 5　两种滚动训练的样本区间、扣费年度收益和名单重合度
+## 表 5　中证500日频选股结果（2023–2025 年）
+
+[table_5_performance.csv](table_5_performance.csv)，共 12 行。
+
+- [ml_study/daily_pair_tuning_20261122_100328_550844/comparison.csv](../sources/ml_study/daily_pair_tuning_20261122_100328_550844/comparison.csv)
+- [ml_study/daily_expanding_pair_20261122_133152_853377/comparison.csv](../sources/ml_study/daily_expanding_pair_20261122_133152_853377/comparison.csv)
+- [ml_study/daily_sliding_pair_20261122_150725_707868/comparison.csv](../sources/ml_study/daily_sliding_pair_20261122_150725_707868/comparison.csv)
+- [ml_study/daily_xgboost_tuned_20261121_172019_402981/nav_comparison/metrics.csv](../sources/ml_study/daily_xgboost_tuned_20261121_172019_402981/nav_comparison/metrics.csv)
+- [ml_study/mlp_report_median_20261126/portfolio_metrics.csv](../sources/ml_study/mlp_report_median_20261126/portfolio_metrics.csv)
+- [ml_study/mlp_report_median_20261126/rank_ic_summary.csv](../sources/ml_study/mlp_report_median_20261126/rank_ic_summary.csv)
+- [ml_study/daily_mad_ridge_20261122_145614_730197/portfolio_metrics.csv](../sources/ml_study/daily_mad_ridge_20261122_145614_730197/portfolio_metrics.csv)
+- [ml_study/daily_mad_ridge_20261122_145614_730197/rank_ic_summary.csv](../sources/ml_study/daily_mad_ridge_20261122_145614_730197/rank_ic_summary.csv)
+- [ml_study/daily_20261121_092926_223980/portfolio_metrics.csv](../sources/ml_study/daily_20261121_092926_223980/portfolio_metrics.csv)
+- [ml_study/daily_20261121_092926_223980/rank_ic_summary.csv](../sources/ml_study/daily_20261121_092926_223980/rank_ic_summary.csv)
+
+## 补充数据　两种滚动训练的样本区间、扣费年度收益和名单重合度
 
 [table_4_windows.csv](table_4_windows.csv)，共 3 行。
 
@@ -46,18 +61,3 @@
 - [ml_study/daily_sliding_pair_20261122_150725_707868/2024/periods.csv](../sources/ml_study/daily_sliding_pair_20261122_150725_707868/2024/periods.csv)
 - [ml_study/daily_expanding_pair_20261122_133152_853377/2025/periods.csv](../sources/ml_study/daily_expanding_pair_20261122_133152_853377/2025/periods.csv)
 - [ml_study/daily_sliding_pair_20261122_150725_707868/2025/periods.csv](../sources/ml_study/daily_sliding_pair_20261122_150725_707868/2025/periods.csv)
-
-## 表 6　中证500日频选股结果（2023–2025 年）
-
-[table_5_performance.csv](table_5_performance.csv)，共 12 行。
-
-- [ml_study/daily_pair_tuning_20261122_100328_550844/comparison.csv](../sources/ml_study/daily_pair_tuning_20261122_100328_550844/comparison.csv)
-- [ml_study/daily_expanding_pair_20261122_133152_853377/comparison.csv](../sources/ml_study/daily_expanding_pair_20261122_133152_853377/comparison.csv)
-- [ml_study/daily_sliding_pair_20261122_150725_707868/comparison.csv](../sources/ml_study/daily_sliding_pair_20261122_150725_707868/comparison.csv)
-- [ml_study/daily_xgboost_tuned_20261121_172019_402981/nav_comparison/metrics.csv](../sources/ml_study/daily_xgboost_tuned_20261121_172019_402981/nav_comparison/metrics.csv)
-- [ml_study/daily_mlp_lambdarank_20261122_131215_786064/portfolio_metrics.csv](../sources/ml_study/daily_mlp_lambdarank_20261122_131215_786064/portfolio_metrics.csv)
-- [ml_study/daily_mlp_lambdarank_20261122_131215_786064/rank_ic_summary.csv](../sources/ml_study/daily_mlp_lambdarank_20261122_131215_786064/rank_ic_summary.csv)
-- [ml_study/daily_mad_ridge_20261122_145614_730197/portfolio_metrics.csv](../sources/ml_study/daily_mad_ridge_20261122_145614_730197/portfolio_metrics.csv)
-- [ml_study/daily_mad_ridge_20261122_145614_730197/rank_ic_summary.csv](../sources/ml_study/daily_mad_ridge_20261122_145614_730197/rank_ic_summary.csv)
-- [ml_study/daily_20261121_092926_223980/portfolio_metrics.csv](../sources/ml_study/daily_20261121_092926_223980/portfolio_metrics.csv)
-- [ml_study/daily_20261121_092926_223980/rank_ic_summary.csv](../sources/ml_study/daily_20261121_092926_223980/rank_ic_summary.csv)

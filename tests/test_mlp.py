@@ -58,7 +58,8 @@ class MLPTests(unittest.TestCase):
         train = np.array([[1, 3, np.nan], [3, 3, np.nan], [np.nan, 3, np.nan]])
         stats = fit_scale(train, ["f1", "f2", "f3"])
         held = np.array([[np.nan, 6, 9], [8, 3, np.nan], [-1, 3, 0]])
-        np.testing.assert_allclose(transform(held, stats).numpy(), [[.5, 0, 0], [1, 0, 0], [0, 0, 0]])
+        np.testing.assert_allclose(transform(held, stats).numpy(), [[2, 6, 9], [8, 3, 0], [-1, 3, 0]])
+        np.testing.assert_allclose(transform(held, stats, "minmax").numpy(), [[.5, 0, 0], [1, 0, 0], [0, 0, 0]])
 
     def test_daily_scaling_uses_only_same_day_observations(self):
         import pandas as pd

@@ -13,7 +13,6 @@ tutorials/*
 /data/**
 /results/
 /docs/results/*
-!/docs/results/csi500_research.md
 !/docs/results/csi500_research/
 !/docs/results/expanding_pair_daily.md
 !/docs/results/sliding_pair_daily.md

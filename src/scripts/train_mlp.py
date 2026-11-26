@@ -109,7 +109,7 @@ def main(argv=None):
     if args.walk_forward is not None and min(args.walk_forward, args.train_months, args.stop_months) < 1:
         parser.error("滚动窗口月数必须为正整数")
     cfg = load_config(args.config)
-    cfg["mlp_input_scaling"] = args.input_scaling or cfg.get("mlp_input_scaling", cfg["mlp"].get("input_scaling", "minmax"))
+    cfg["mlp_input_scaling"] = args.input_scaling or cfg.get("mlp_input_scaling", cfg["mlp"].get("input_scaling", "none"))
     set_label_days(cfg, args.label_days)
     source = args.source or Path(json.loads((RUNS / "baselines/nav_comparison_daily/rank_config.json").read_text())["feature_source"])
     names = alpha158_columns(source)
