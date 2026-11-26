@@ -1,4 +1,4 @@
-"""从实验产物生成中证500策略比较报告和 Alpha101 因子报告。"""
+"""从实验产物生成中证500策略比较和排序模型报告。"""
 
 import hashlib
 import json
@@ -96,7 +96,8 @@ def write_results(config: dict, config_path: Path, inputs: dict[str, Path], out:
         best = training["best_iteration"]
         losses = curve.loc[curve.iteration.eq(best)].iloc[0]
         plot_training_mse(out, curve, best, losses.validation_mse, raw_labels=raw_labels)
-        training_details = f"固定 LightGBM 在第 {best} 轮取得最佳验证结果，训练 / 验证 MSE 为 {losses.train_mse:.6f} / {losses.validation_mse:.6f}。"
+        early_start, early_end = training.get("early_stop_bounds", config["segments"]["validation"])
+        training_details = f"固定 LightGBM 在 {early_start} 至 {early_end} 早停，第 {best} 轮的训练 / 早停 MSE 为 {losses.train_mse:.6f} / {losses.validation_mse:.6f}。"
 
     plot_rank_ic(out, daily_ic, switch_dates, strategies, display, colors)
     plot_quintiles(out, all_groups, buckets, horizon, strategies, display, colors)
@@ -223,192 +224,6 @@ def write_manifest(config_path: Path, inputs: dict[str, Path], out: Path, root: 
     }, indent=2) + "\n")
 
 
-def write_alpha101_report(summary: pd.DataFrame, frame: pd.DataFrame, out: Path, config: dict,
-                          *, root: Path = ROOT) -> Path:
-    """根据原始和中性化因子的评价表生成排名、样本覆盖与计算说明。"""
-    def signed(value):
-        return f"{value:+.5f}" if pd.notna(value) else "—"
-
-    target = root / "docs" / "factors" / "alpha101_ic_daily.md"
-    link = Path(os.path.relpath(out, target.parent)).as_posix()
-    raw = summary.query("version == 'raw'").set_index("factor")
-    neutral = summary.query("version == 'neutral'").set_index("factor")
-    labels = frame.dropna(subset=["label"])
-    eligible_days = labels.trade_date.nunique()
-    complete = neutral.loc[neutral.n_days.eq(eligible_days) & neutral.n_pairs.ge(0.8 * len(labels))]
-    body = ["# 中证500 Alpha101 单因子检验",
-            f"{labels.trade_date.min():%Y-%m-%d} 至 {labels.trade_date.max():%Y-%m-%d} 共有 "
-            f"{eligible_days} 个可评价信号日、{len(labels):,} 个有收益标签的股票日。"
-            f"101 项因子中，{neutral.mean_rank_ic.notna().sum()} 项得到中性化后的 Rank IC。",
-            "**表　绝对值榜首，保留符号并列出有效交易日**"]
-    rows = []
-    for metric, title in IC_COLUMNS.items():
-        row = [title]
-        for group in (raw, neutral, complete):
-            valid = group[metric].dropna()
-            if valid.empty:
-                row.append("—")
-                continue
-            name = valid.abs().idxmax()
-            row.append(f"{name}　{signed(valid[name])}（{int(group.loc[name,'n_days'])} 天）")
-        rows.append(row)
-    body += [markdown_table(["指标", "原始全部", "中性化全部", "中性化且覆盖充分¹"], rows),
-             "**表　中性化 Rank ICIR 绝对值前十名（全部因子）**"]
-    ranked = neutral.sort_values("abs_rank_icir_rank", kind="stable")
-    top = ranked.loc[ranked.abs_rank_icir_rank.le(10)]
-    body.append(markdown_table(["名次", "因子", "Rank ICIR 绝对值", "Rank ICIR", "Rank IC", "有效日", "有效股票日"], (
-        [int(row.abs_rank_icir_rank), name, f"{abs(row.rank_icir):.5f}", signed(row.rank_icir),
-         signed(row.mean_rank_ic), int(row.n_days), f"{int(row.n_pairs):,}"] for name, row in top.iterrows())))
-    if not complete.empty:
-        inverse = complete.mean_rank_ic.idxmin()
-        body.append(f"覆盖充分的因子中，{inverse} 的 Rank IC 最低（{signed(complete.at[inverse, 'mean_rank_ic'])}），"
-                    f"Rank ICIR 为 {signed(complete.at[inverse, 'rank_icir'])}。")
-    body += [f"¹ 覆盖充分指 {eligible_days} 天均有 Rank IC，且有效股票日达到全部有标签股票日的 80%。完整榜保留其余因子。", "## 计算方法与覆盖",
-             f"公式取自华泰研报图表 2–4。开高低收和 VWAP 使用项目复权价格，成交量沿用原始成交量。"
-             f"ADV 是过去指定交易日的平均成交量。历史窗口的截面排名按信号日成分名单重算，组内行业采用各历史日生效的分类。"
-             f"公式内部和最终回归都用本地申万一级行业，研报使用中信一级。"
-             f"研报研究全 A 股、5/10/20 日周期，本表使用动态中证500，"
-             f"原始收益标签为 T+{config['label_end_days']} 复权收盘价 / T+{config['label_start_days']} 复权收盘价 − 1。"
-             " [华泰原文，第 5–8 页](https://crm.htsc.com.cn/doc/2019/10750101/dae9cd9e-c2cd-4f05-bb6c-e5ac8d216d3d.pdf#page=5)",
-             "小数窗口向下取整，时间窗口要求完整观测。并列排名取平均，窗口极值位置从最早的交易日计为 1，并列时取首次。"
-             "相关窗口缺值或方差为零、分母为零时保留 NaN。两个滚动信号逐元素取最值时要求两者均有效。"
-             " [原论文，附录 A](https://arxiv.org/pdf/1601.00991#page=15)",
-             "原始分数保留公式自带的行业操作。中性化版对每个因子逐日做 5 倍 MAD 截尾、行业与对数总市值等权回归、残差标准化。"
-             "用各因子自己的有效股票日对齐原始未来收益。Qlib 的逐日 Pearson、Spearman 相关系数分别求均值得到 IC、Rank IC。"
-             "ICIR、Rank ICIR 用相应均值除以逐日样本标准差，不年化。负值表示低分股票随后的收益倾向更高。"
-             "绝对值排名保留这类信号，方向按研究期外验证。"]
-    sparse = neutral.loc[neutral.n_days.lt(eligible_days / 2) | neutral.n_pairs.lt(len(labels) / 2)]
-    if not sparse.empty:
-        sparse = sparse.sort_index(key=lambda names: names.str.removeprefix("Alpha").astype(int))
-        body.append("**表　有效样本不足一半的因子**")
-        body.append("以下因子的有效交易日或有效股票日少于样本的一半。少量股票的相关系数容易接近 ±1，应结合覆盖一起读。")
-        body.append(markdown_table(["因子", "原始有效日", "原始股票日", "中性化有效日", "中性化股票日"], (
-            [name, int(raw.at[name, "n_days"]), int(raw.at[name, "n_pairs"]), int(row.n_days), int(row.n_pairs)]
-            for name, row in sparse.iterrows())))
-    audit = out / "constant_window_audit.csv"
-    if audit.is_file():
-        changes = pd.read_csv(audit).set_index("factor")
-        body.append(f"旧版滚动计算在常数窗口内可能因浮点舍入产生微小波动。本次显式检查取值是否相同，"
-                    f"Alpha3 有 {changes.at['Alpha3','now_missing']:,} 个股票日、Alpha44 有 "
-                    f"{changes.at['Alpha44','now_missing']:,} 个股票日的相关系数改为缺失。常数窗口的协方差取零后，"
-                    f"Alpha13 有 {changes.at['Alpha13','changed_valid_scores']:,} 个股票日因并列排名调整了分数。"
-                    f"这三项的新分数和修正后的原有计算入口逐股逐日相同。 [新旧覆盖核对]({link}/constant_window_audit.csv)")
-    trace = out / "alpha96_coverage.csv"
-    if trace.is_file():
-        coverage = pd.read_csv(trace, index_col=0).iloc[:, 0]
-        body.append(f"Alpha96 要求两条分支同时有效。第二条分支的短窗相关有 {coverage.branch2_corr:,} 个股票日可算，"
-                    f"之后取 12 日极值位置剩 {coverage.branch2_argmax:,} 个，再做 14 日加权平均剩 {coverage.branch2_decay:,} 个，"
-                    f"最后做 13 日时序排名剩 {coverage.branch2:,} 个。 [逐层计数]({link}/alpha96_coverage.csv)")
-    body += [f"[指标、有效样本数和四项绝对值排名]({link}/factor_metrics.csv) · "
-             f"[逐日指标]({link}/daily_ic.parquet) · [原始样本和标签]({link}/alpha101_raw.parquet) · "
-             f"[中性化样本]({link}/neutral.parquet)",
-             "**表　全部 101 项，按中性化 Rank ICIR 绝对值降序排列**",
-             "两版分别用未舍入的绝对值排名，同值并列。指标按原始 → 中性化展示，无定义的因子以 — 表示并列在末尾。"]
-    body.append(markdown_table(["中性化名次", "原始名次", "因子", *IC_COLUMNS.values(), "中性化有效日", "中性化股票日"], (
-        [*(int(rank) if pd.notna(rank) else "—" for rank in (row.abs_rank_icir_rank, raw.at[name, "abs_rank_icir_rank"])),
-         name, *[f"{signed(raw.at[name,m])} → {signed(row[m])}" for m in IC_COLUMNS],
-         int(row.n_days), f"{int(row.n_pairs):,}"] for name, row in ranked.iterrows())))
-    return save_report(target, "\n\n".join(body) + "\n")
-
-
-def write_equal_weight(config: dict, source: Path, out: Path, directions: pd.DataFrame) -> Path:
-    """对照同一测试期的等权组合、已回测的 LightGBM 和中证500。"""
-    from src.report.charts import plot_portfolio_nav
-
-    suffix, frequency = rebalance_frequency(config["rebalance_days"])
-    with_ridge = (out / "ridge_trials.csv").is_file()
-    experiment = "alpha158_ridge_comparison" if with_ridge else "alpha158_equal_weight"
-    report = ROOT / "docs/results" / f"{experiment}_{suffix}.md"
-    links = os.path.relpath(out, report.parent)
-    labels = dict(equal_weight="方向统一等权", neutral_tuned="中性化 LightGBM（验证最优）",
-                  matched_raw="原始 Alpha158 LightGBM（同样本）", benchmark="中证500价格指数")
-    ic = pd.read_csv(out / "rank_ic_summary.csv").query('year == "all"').set_index(["split", "strategy"])
-    strategies = ["equal_weight"]
-    ridge_section = ""
-    if with_ridge:
-        trials = pd.read_csv(out / "ridge_trials.csv").set_index("alpha")
-        criterion = "fold_mean_mse" if "fold_mean_mse" in trials else "validation_mse"
-        best = trials[criterion].idxmin()
-        labels["ridge_strong"] = f"强正则 Ridge（α={best:,.0f}）"
-        strategies = ["ridge_strong", "equal_weight"]
-        trial_table = markdown_table(["α", "训练 MSE", "验证 MSE", "训练 Rank IC", "验证 Rank IC", "系数 L2 范数"],
-            [[f"{alpha:,.0f}", f"{r.train_mse:.7f}", f"{r.validation_mse:.7f}", f"{r.train_rank_ic:.4f}",
-              f"{r.validation_rank_ic:.4f}", f"{r.coefficient_norm:.5f}"] for alpha, r in trials.iterrows()])
-        ridge_section = f"""## 岭回归正则化强度
-
-**表　训练及验证结果**
-
-{trial_table}
-
-Ridge 的输入为 158 列中性化特征。训练期拟合缺失值中位数、标准化参数及线性系数，训练和验证沿用来源实验的 `{config['training_label']}` 收益标签并剔除跨期标签。α 越大，平方误差总和中附加的系数惩罚越强。按 {criterion} 选定 α={best:,.0f} 用于测试期回测。测试期沿用项目此前的研究区间。
-
-[各档正则化指标]({links}/ridge_trials.csv) · [最佳配置]({links}/best_config.json) · [最优模型及预处理器]({links}/ridge.joblib)
-
-"""
-    portfolio = pd.read_csv(out / "portfolio_metrics.csv").groupby("strategy").mean(numeric_only=True)
-    archived = pd.read_csv(source / "comparison.csv").set_index("strategy")
-    columns = ["total_return", "annual_return", "annualized_excess_return", "information_ratio", "max_drawdown"]
-    if abs(archived.at["benchmark", "total_return"] - portfolio.at["benchmark", "total_return"]) > 1e-10:
-        raise ValueError("两次实验的指数收益不一致")
-    references = [s for s in ("neutral_tuned", "matched_raw") if s in archived.index]
-    summary = pd.concat([portfolio.loc[strategies].join(ic.loc["test", list(IC_COLUMNS)]),
-                         archived.loc[[*references, "benchmark"]]])
-    summary.rename_axis("strategy").to_csv(out / "comparison.csv")
-    fields = [*columns, *IC_COLUMNS]
-    formats = [".2%", ".2%", ".2%", ".3f", ".2%", *([".4f"] * 4)]
-    table = markdown_table(["方法", "累计收益", "绝对年化", "年化超额", "信息比率", "最大回撤", *IC_COLUMNS.values()],
-                           [[labels[name], *(format(row[k], f) if pd.notna(row[k]) else "—" for k, f in zip(fields, formats))]
-                            for name, row in summary.iterrows()])
-    ledger = pd.read_parquet(out / "ledger.parquet")
-    display = dict(equal_weight="Equal weight", neutral_tuned="Neutral LightGBM", matched_raw="Raw LightGBM",
-                   benchmark="CSI 500", ridge_strong="Strong Ridge")
-    colors = dict(equal_weight="#007763", neutral_tuned="#a83464", matched_raw="#326299",
-                  ridge_strong="#6737a2")
-    paths = ledger
-    if references:
-        old = pd.read_parquet(source / "ledger.parquet")
-        paths = pd.concat([ledger, old.loc[old.strategy.isin(references)]])
-    plot_portfolio_nav(out, paths, [], (*strategies, *references), display, colors)
-    positive, negative = (directions.direction.eq(s).sum() for s in (1, -1))
-    families = directions.loc[directions.direction.ne(0), "family"].nunique()
-    train, valid, test = (config["segments"][k] for k in ("train", "validation", "test"))
-    track_caption = ("组合使用日频 offset 0 单轨道。" if config["rebalance_days"] == 1
-                     else f"组合净值按 {config['rebalance_days']} 条调仓轨道等权平均。")
-    key = strategies[0]
-    principal = ledger.loc[ledger.strategy.eq(key)]
-    name = labels[key]
-    if with_ridge:
-        annual = principal.assign(excess=principal.daily_return - principal.benchmark_return).groupby(
-            [principal.trade_date.dt.year, "offset"]).excess.mean().groupby(level=0).mean() * 238
-        ridge_section += "强正则 Ridge 的分年扣费年化超额为 " + "、".join(
-            f"{year} 年 {value:+.2%}" for year, value in annual.items()) + "。\n\n"
-    gross = 238 * (principal.daily_return_before_cost - principal.benchmark_return).mean()
-    fee = 238 * principal.cost_rate.mean()
-    title = "中性化 Alpha158 岭回归与等权选股" if with_ridge else "中性化 Alpha158 方向统一等权选股"
-    return save_report(report, f"""# {title}
-
-{test[0]} 至 {test[1]}，{name}组合扣费累计收益 **{summary.at[key, 'total_return']:.2%}**，绝对年化 **{summary.at[key, 'annual_return']:.2%}**，相对中证500的年化超额 **{summary.at[key, 'annualized_excess_return']:.2%}**。
-
-**表　同一测试期的组合绩效和每日截面 IC**
-
-{table}
-
-所有策略沿用来源实验的 Qlib TopkDropoutStrategy，目标 {config['topk']} 只，每次计划替换 {config['n_drop']} 只，{frequency}调仓。买入和卖出费率分别为 {config['buy_fee_bps']}、{config['sell_fee_bps']} bp。年化超额按每日扣费收益与指数收益之差的均值乘以 238 计算。{name}组合扣费前年化超额为 {gross:+.2%}，交易费用消耗 {fee*100:.2f} 个百分点。
-
-![组合与指数净值]({links}/portfolio_nav.svg)
-
-图 1　横轴为测试期交易日，纵轴为从 1 起算的净值。实线表示各选股组合的扣费净值，虚线表示中证500价格指数。各曲线覆盖同一交易日历。{track_caption}
-
-{ridge_section}## 等权因子如何合成
-
-方向只用 {train[0]} 至 {train[1]} 的有效未来收益确定，标签终点也须在训练期内。每列按日计算 Spearman 相关，取跨日均值的符号，并要求超过半数训练年份的日均相关同号。158 列中保留正向 {positive} 列、反向 {negative} 列，跳过 {len(directions)-positive-negative} 列。入选的 {families} 个公式家族等权。
-
-每天先对反向列乘以 −1，再在当日股票截面取百分位排名，并列取平均名次。同一公式的多个窗口先等权，随后按每只股票当日有效家族取平均。缺失值跳过，所有家族都缺失时该股票无分。验证期（{valid[0]} 至 {valid[1]}）的 Rank IC 为 {ic.at[('validation', 'equal_weight'), 'mean_rank_ic']:.4f}，测试期为 {ic.at[('test', 'equal_weight'), 'mean_rank_ic']:.4f}。两期沿用冻结的方向和权重规则。
-
-[逐列方向及分年 Rank IC]({links}/directions.csv) · [全期及分年 IC]({links}/rank_ic_summary.csv) · [分组收益]({links}/quintile_summary.csv) · [测试期总表]({links}/comparison.csv) · [逐日预测]({links}/predictions.parquet) · [交易账本]({links}/ledger.parquet) · [缓存来源]({links}/source.json)
-""")
-
-
 def write_lambdarank(out: Path, k: int, best_iteration: int) -> Path:
     """将头部排序质量与同一组预测的实际组合收益并列展示。"""
     from src.report.charts import plot_portfolio_nav
@@ -481,7 +296,7 @@ def write_lambdarank(out: Path, k: int, best_iteration: int) -> Path:
 
 {table}
 
-表内所有模型的 NDCG 统一按原版头部标签计算，便于横向比较。NDCG 越接近 1，表示模型越能把当天事后收益靠前的股票排在前面，榜首的权重更高。命中比例是预测前 {k} 名中有多少落入真实前 {k}（含边界并列）。落入后 {k} 比例衡量同一批入选股票中，有多少实际落入收益最低的 {k} 名（含边界并列）。排序诊断及平均标签收益均在有有效标签的股票内计算。收益标签从 T+1 收盘到 T+2 收盘。
+表内所有模型的 NDCG 统一按原版头部标签计算，便于横向比较。NDCG 越接近 1，表示模型越能把当天事后收益靠前的股票排在前面，榜首的权重更高。命中比例是预测前 {k} 名中有多少落入真实前 {k}（含边界并列）。落入后 {k} 比例衡量同一批入选股票中，有多少实际落入收益最低的 {k} 名（含边界并列）。排序诊断及平均标签收益均在有有效标签的股票内计算。收益标签从 T+1 收盘到 T+{cfg["label_end_days"]} 收盘。
 
 **表　{cfg["segments"]["test"][0]} 至 {cfg["segments"]["test"][1]} 组合与指数**
 
@@ -558,7 +373,7 @@ def write_bottom_comparison(out: Path) -> Path:
 
 {validation}
 
-预测名单在有有效标签的股票中按分数取前 {k}，命中和误选分别按真实前、后 {k}（含边界并列）计算，每日等权。远期收益为 T+1 收盘至 T+2 收盘的个股收益。
+预测名单在有有效标签的股票中按分数取前 {k}，命中和误选分别按真实前、后 {k}（含边界并列）计算，每日等权。远期收益为 T+1 收盘至 T+{cfg["label_end_days"]} 收盘的个股收益。
 
 **表　测试期选股与组合表现（{cfg['segments']['test'][0]} 至 {cfg['segments']['test'][1]}）**
 

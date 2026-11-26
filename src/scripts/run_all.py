@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import CONFIG_FILE, load_config, load_tuning, rebalance_frequency, validate_lightgbm_grid, walk_forward_policy
+from src.config import label_argument, set_label_days, CONFIG_FILE, fixed_validation, load_config, load_tuning, rebalance_frequency, validate_lightgbm_grid, validation_argument, walk_forward_policy
 from src.data.download import save_parquet
 from src.data.research_panel import (
     CSI500_INPUTS as INPUTS, ROOT, ResearchPanel, load_market_calendar, prepare_inputs,
@@ -30,13 +30,16 @@ def new_run(rebalance_days: int | None = None, *, tag: str = "", root: Path = RU
     return root / "_".join(parts)
 
 
-def latest_run(*required: str, rebalance_days: int) -> Path:
+def latest_run(*required: str, rebalance_days: int, winner_families=()) -> Path:
     """按末尾时间戳查找同一调仓周期的最近完整实验，兼容旧目录名。"""
     for path in sorted(RUNS.glob("*"), key=lambda item: item.name[-22:], reverse=True):
         config_path = path / "config.json"
         if path.is_dir() and config_path.is_file() and all((path / name).is_file() for name in required):
-            if json.loads(config_path.read_text())["rebalance_days"] == rebalance_days:
-                return path
+            if json.loads(config_path.read_text()).get("rebalance_days") != rebalance_days:
+                continue
+            if winner_families and set(json.loads((path / "winners.json").read_text())) != set(winner_families):
+                continue
+            return path
     raise FileNotFoundError("没有可继续的实验，请先运行 run_all，或用 --out 指定已有实验目录")
 
 
@@ -115,6 +118,8 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
         parser.add_argument("--tuning-config", type=Path, help="仅用于 --stage tune，默认 configs/tuning.json")
         parser.add_argument("--stage", choices=("all", "evaluate", "tune"), default="all",
                             help="tune 用验证集调参，evaluate 使用已有预测刷新比较")
+    label_argument(parser)
+    validation_argument(parser)
     args = parser.parse_args(argv)
     evaluate = args.stage == "evaluate"
     tuning = args.stage == "tune"
@@ -127,6 +132,14 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
     config_path = args.config or (out / "config.json" if evaluate and out is not None else CONFIG_FILE)
     # 加载研究配置，确定输出目录等
     config = load_config(config_path)
+    if evaluate and args.label_days is not None:
+        parser.error("归档复评沿用训练标签")
+    set_label_days(config, args.label_days)
+    if evaluate and args.validation_mode:
+        parser.error("归档复评沿用原验证模式")
+    if args.validation_mode:
+        config.setdefault("rolling_validation_bounds", list(config["segments"]["validation"]))
+    fixed_validation(config, args.validation_mode)
     if out is None:
         out = new_run(tag="tuning") if tuning else new_run(config["rebalance_days"], tag="lightgbm" if lightgbm_only else "")
     out = out.resolve()
@@ -144,7 +157,8 @@ def main(argv=None, *, lightgbm_only: bool = False) -> None:
         if tuning:
             from src.ml.tuning import tune_lightgbm
 
-            config["walk_forward"] = walk_forward_policy(config)
+            if not config.get("validation_mode"):
+                config["walk_forward"] = walk_forward_policy(config)
             config["lightgbm_tuning"] = load_tuning("lightgbm_tuning", config, args.tuning_config)
             validate_lightgbm_grid(config["lightgbm_tuning"], config["lightgbm"])
         out.mkdir(parents=True, exist_ok=True)

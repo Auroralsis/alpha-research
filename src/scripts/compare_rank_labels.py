@@ -9,11 +9,13 @@ import numpy as np
 import pandas as pd
 
 from src.backtest.engine import evaluate_signals
-from src.config import load_config, load_tuning
+from src.config import label_argument, set_label_days, fixed_validation, load_config, load_tuning, validation_argument
 from src.data.research_panel import segment_masks
+from src.ml.rank_validation import bottom_members, holding_bottom_rates
 from src.ml.dataset import alpha158_columns, fitting_targets, read_feature_split
 from src.report.research import write_bottom_comparison, write_lambdarank
 from src.scripts.run_all import new_run
+from src.scripts.train_lightgbm import fit_ranker
 
 MODELS = ("mse", "lambdarank")
 
@@ -35,31 +37,12 @@ def quantile_relevance(frame: pd.DataFrame, grades: int) -> pd.Series:
     return np.floor(grades * position).astype("int32")
 
 
-def bottom_members(frame: pd.DataFrame, k: int) -> pd.Series:
-    """按信号日识别真实收益最低的 k 只，边界并列全部计入。"""
-    return frame.groupby("trade_date").label.rank(method="min").le(k)
-
-
 def bottom_relevance(frame: pd.DataFrame, k: int) -> pd.Series:
     """后 k 名赋零分，其余股票按当日平均名次划入 1–9 档。输入仅含有效收益。"""
     above = ~bottom_members(frame, k)
     labels = pd.Series(0, index=frame.index, dtype="int32")
     labels.loc[above] = 1 + quantile_relevance(frame.loc[above], 9)
     return labels
-
-
-def holding_bottom_rates(holdings: pd.DataFrame, scores: pd.DataFrame, dates: pd.DatetimeIndex, k: int) -> pd.DataFrame:
-    """用 T 日标签评价 T+1 收盘实持股票，逐日保留可评价及全部持仓数。"""
-    ranked = scores.loc[scores.evaluable, ["trade_date", "ticker", "label"]].copy()
-    ranked["bottom"] = bottom_members(ranked, k)
-    execution = pd.Series(dates[1:], index=dates[:-1])
-    ranked["trade_date"] = ranked.trade_date.map(execution)
-    held = holdings.loc[holdings.amount.gt(0)].merge(ranked[["trade_date", "ticker", "bottom"]],
-                                                     on=["trade_date", "ticker"], how="left", validate="many_to_one")
-    daily = held.groupby(["strategy", "offset", "trade_date"]).bottom.agg(
-        held="size", evaluable="count", in_bottom="sum").reset_index()
-    daily["held_bottom_rate"] = daily.in_bottom / daily.evaluable.where(daily.evaluable.gt(0))
-    return daily
 
 
 def ranking_diagnostics(scored: pd.DataFrame, k: int, models: tuple[str, ...] = MODELS) -> pd.DataFrame:
@@ -81,23 +64,6 @@ def ranking_diagnostics(scored: pd.DataFrame, k: int, models: tuple[str, ...] = 
     return pd.DataFrame(rows)
 
 
-def fit_ranker(datasets: list[lgb.Dataset], params: dict, cfg: dict, directory: Path) -> lgb.Booster:
-    """按独立验证期 NDCG 早停，保存最优模型和逐轮曲线。"""
-    history = {}
-    ranker = lgb.train(params, datasets[0], num_boost_round=cfg["num_boost_round"],
-                       valid_sets=datasets, valid_names=["train", "validation"],
-                       callbacks=[lgb.early_stopping(cfg["early_stopping_rounds"], verbose=False),
-                                  lgb.record_evaluation(history)])
-    metric = f"ndcg@{cfg['topk']}"
-    curve = pd.DataFrame({split: values[metric] for split, values in history.items()})
-    curve.index = pd.RangeIndex(1, len(curve) + 1, name="iteration")
-    curve.to_csv(directory / "training_ndcg.csv")
-    ranker.save_model(str(directory / "lambdarank.txt"), num_iteration=ranker.best_iteration)
-    print(f"{directory.name} 最佳轮数 {ranker.best_iteration}，验证 {metric}={curve.validation.max():.6f}", flush=True)
-
-    return ranker
-
-
 def compare_gains(source, out, cfg, names, params, candidates):
     """在每折用独立早停期拟合，按选参年的尾部误选率和收益比较增益。"""
     from src.ml.walk_forward import folds
@@ -106,7 +72,7 @@ def compare_gains(source, out, cfg, names, params, candidates):
     for fold in folds(cfg):
         frames = {}
         for split, bounds in fold.items():
-            raw = read_feature_split(source / "features.parquet", bounds, split)
+            raw = read_feature_split(source / "features.parquet", bounds, split, cfg)
             mask = segment_masks(raw, {split: bounds})[split]
             frame = raw.loc[mask].sort_values(["trade_date", "ticker"])
             if split != "validation":
@@ -131,9 +97,11 @@ def compare_gains(source, out, cfg, names, params, candidates):
 
 
 def run(source: Path, previous: Path | None = None, *, target: str | None = None,
-        tuning_config: Path | None = None) -> Path:
+        tuning_config: Path | None = None, validation_mode=None, label_days=None) -> Path:
     """读取原基线配置、模型和特征，按交易日分组训练，冻结后再生成测试预测与回测。"""
     cfg = load_config(source / "best_config.json")
+    set_label_days(cfg, label_days)
+    fixed_validation(cfg, validation_mode)
     if target is None:
         target = "graded" if previous else "topk"
     controls = {}
@@ -165,7 +133,8 @@ def run(source: Path, previous: Path | None = None, *, target: str | None = None
         if not isinstance(gaps, list) or not gaps or any(type(gap) is not int or gap < 1 for gap in gaps):
             raise ValueError("lambdarank_bottom_gaps 需要非空的正整数列表")
         candidates = {f"gap_{gap}": [0, *range(gap, gap + 9)] for gap in gaps}
-        cfg["walk_forward"] = load_config()["walk_forward"]
+        if not cfg.get("validation_mode"):
+            cfg["walk_forward"] = load_config()["walk_forward"]
         compare_gains(source, out, cfg, names, params, candidates)
         (out / "gain_candidates.json").write_text(json.dumps(candidates, indent=2) + "\n")
     (out / "config.json").write_text(json.dumps(dict(cfg, lightgbm=params), indent=2) + "\n")
@@ -175,12 +144,13 @@ def run(source: Path, previous: Path | None = None, *, target: str | None = None
     print(f"实验目录 {out}", flush=True)
 
     def read(split):
-        return read_feature_split(source / "features.parquet", cfg["segments"][split], split)
+        return read_feature_split(source / "features.parquet", cfg["segments"][split], split, cfg)
 
     datasets = []
     for split in ("train", "validation"):
-        raw = read(split)
-        eligible = raw.loc[segment_masks(raw, cfg["segments"])[split]]
+        bounds = cfg.get("early_stop_bounds", cfg["segments"][split]) if split == "validation" else cfg["segments"][split]
+        raw = read_feature_split(source / "features.parquet", bounds, split, cfg)
+        eligible = raw.loc[segment_masks(raw, {split: bounds})[split]]
         index = fitting_targets(eligible, cfg["training_label"]).index
         frame = eligible.loc[index].sort_values(["trade_date", "ticker"])
         groups = frame.groupby("trade_date", sort=False).size()
@@ -221,12 +191,19 @@ def run(source: Path, previous: Path | None = None, *, target: str | None = None
     keys = ["split", "trade_date", "ticker"]
     archived = pd.read_parquet(source / "predictions.parquet", columns=keys + [baseline_tag]).set_index(keys)
     replay = scored.set_index(keys)["mse"].sort_index()
+    if validation_mode:
+        archived = archived.reindex(replay.index).dropna()
+        replay = replay.loc[archived.index]
     pd.testing.assert_index_equal(replay.index, archived.sort_index().index)
     np.testing.assert_allclose(replay, archived.sort_index()[baseline_tag], rtol=0, atol=1e-12)
     if previous is not None:
         columns = list(controls)
         original = pd.read_parquet(previous / "predictions.parquet", columns=keys + columns)
-        pd.testing.assert_frame_equal(scored.set_index(keys)[columns].sort_index(),
+        actual = scored.set_index(keys)[columns].sort_index()
+        if validation_mode:
+            original = original.set_index(keys).reindex(actual.index).dropna().reset_index()
+            actual = actual.loc[original.set_index(keys).index]
+        pd.testing.assert_frame_equal(actual,
                                       original.set_index(keys)[columns].sort_index(), atol=1e-12, rtol=0)
     scored.to_parquet(out / "predictions.parquet", index=False)
     test_dates = evaluate_signals(scored, cfg, out, tuple(models))
@@ -259,19 +236,23 @@ def main(argv=None):
     compare.add_argument("--compare-bottom", type=Path, metavar="十档实验目录", help="比较后 k 名独立成档的候选增益")
     compare.add_argument("--compare-quintile-gap3", type=Path, metavar="五档实验目录", help="五等分标签使用增益 0、3、4、5、6")
     parser.add_argument("--tuning-config", type=Path, help="配合 --compare-bottom 指定增益候选，默认 configs/tuning.json")
+    label_argument(parser)
+    validation_argument(parser)
     args = parser.parse_args(argv)
     if args.tuning_config and not args.compare_bottom:
         parser.error("--tuning-config 需要同时指定 --compare-bottom")
+    from functools import partial
+    launch = partial(run, validation_mode=args.validation_mode, label_days=args.label_days)
     if args.compare_quintile_gap3:
-        report = run(args.source, args.compare_quintile_gap3, target="quintile_gap3")
+        report = launch(args.source, args.compare_quintile_gap3, target="quintile_gap3")
     elif args.compare_bottom:
-        report = run(args.source, args.compare_bottom, target="bottom", tuning_config=args.tuning_config)
+        report = launch(args.source, args.compare_bottom, target="bottom", tuning_config=args.tuning_config)
     elif args.compare_decile:
-        report = run(args.source, args.compare_decile, target="decile")
+        report = launch(args.source, args.compare_decile, target="decile")
     elif args.compare_quintile:
-        report = run(args.source, args.compare_quintile, target="quintile")
+        report = launch(args.source, args.compare_quintile, target="quintile")
     else:
-        report = run(args.source, args.compare_graded)
+        report = launch(args.source, args.compare_graded)
     print(report)
 
 

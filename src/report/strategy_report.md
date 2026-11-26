@@ -15,7 +15,7 @@
 | 阶段 | 日期 | 股票日数 |
 | --- | --- | ---: |
 | 训练 | {train_start} 至 {train_end} | {fit[fitted_rows]:,} |
-| 验证 | {validation_start} 至 {validation_end} | {valid[fitted_rows]:,} |
+| 验证 | {validation_start} 至 {validation_end} | {valid[evaluable_rows]:,} |
 | 测试 | {test_start} 至 {test_end} | {held_out[evaluable_rows]:,} |
 
 模型用{feature_mode}预测 T+{label_end} 相对 T+{label_start} 的复权收盘收益。{training_details}{ridge_losses} [训练日志]({links}/training_log.json)

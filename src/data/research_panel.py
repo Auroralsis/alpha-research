@@ -161,12 +161,16 @@ def execution_labels(panel: ResearchPanel, keys: pd.DataFrame, start: int, end: 
 
     start、end 表示相对信号日的交易日偏移，按市场日历定位价格。
     """
-    date_pos = panel.calendar.get_indexer(keys.trade_date)
-    ticker_pos = panel.tickers.get_indexer(keys.ticker)
+    return labels_from_close(panel.matrix("close_adj"), keys, start, end)
+
+
+def labels_from_close(close, keys, start, end):
+    """以交易日对齐复权收盘价，根据股票日键取得收益。"""
+    date_pos = close.index.get_indexer(keys.trade_date)
+    ticker_pos = close.columns.get_indexer(keys.ticker)
     if (date_pos < 0).any() or (ticker_pos < 0).any() or not 0 < start < end:
         raise ValueError("Invalid label keys or offsets")
-    close = panel.matrix("close_adj")
-    calendar = pd.Series(panel.calendar, index=panel.calendar)
+    calendar = pd.Series(close.index, index=close.index)
     start_close = close.shift(-start).to_numpy()[date_pos, ticker_pos]
     end_close = close.shift(-end).to_numpy()[date_pos, ticker_pos]
     return keys.assign(feature_date=keys.trade_date, label_start_date=keys.trade_date.map(calendar.shift(-start)),
@@ -212,12 +216,15 @@ def prepare_inputs(config: dict, *, need_industry: bool = True) -> pd.DatetimeIn
     return dates
 
 
-def prepare_test_panel(config: dict, market_dates: pd.DatetimeIndex) -> tuple[ResearchPanel, pd.DatetimeIndex]:
+def prepare_test_panel(config: dict, market_dates: pd.DatetimeIndex, *, split="test") -> tuple[ResearchPanel, pd.DatetimeIndex]:
     """读取回测及传统因子预热所需行情，返回测试期交易日。"""
-    start, end = config["segments"]["test"]
+    start, end = config["segments"][split]
     dates = market_dates[market_dates.to_series().between(start, end).to_numpy()]
     if dates.empty:
         raise ValueError("测试期缺少交易日")
     first = market_dates.get_indexer(dates[:1])[0]
     working = market_dates[max(first - 21, 0):first + len(dates)]
-    return prepare_panel(pd.read_parquet(CSI500_INPUTS["prices"]), working), dates
+    prices = pd.read_parquet(CSI500_INPUTS["prices"])
+    if split == "validation":
+        prices = prices.loc[parse_dates(prices.trade_date).to_numpy() <= dates[-1]]
+    return prepare_panel(prices, working), dates

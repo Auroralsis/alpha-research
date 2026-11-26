@@ -41,6 +41,8 @@ def rolling_windows(dates: pd.DatetimeIndex, config: dict, feature_start: pd.Tim
     if not pd.DatetimeIndex(adjuster.cals).as_unit("ns").equals(dates.as_unit("ns")):
         raise ValueError("Qlib calendar differs from the project market calendar")
     segments = {name: tuple(bounds) for name, bounds in config["segments"].items()}
+    if config.get("rolling_validation_bounds"):
+        segments["validation"] = tuple(config["rolling_validation_bounds"])
     nominal = adjuster.align_seg(segments)
     first = max(nominal["train"][0], feature_start)
     segments["train"] = (first, segments["train"][1])
@@ -238,9 +240,9 @@ def study_windows(config: dict, out: Path, predictions: pd.DataFrame) -> list[di
     # layers 和 main_offset 是旧实验的回测展示参数，可在复用预测时省略。
     evaluation_keys = {"walk_forward", "layers", "min_regression_pairs", "topk", "n_drop", "rebalance_days", "main_offset",
                        "buy_price", "buy_fee_bps", "sell_fee_bps", "initial_capital_cny", "limit_threshold",
-                       "single_catboost", "catboost_four_equal", "lightgbm_four_equal", "four_model_targets", "lightgbm_xgboost_blend",
+                       "six_grade_targets", "catrank_regressor", "single_catboost", "catboost_four_equal", "lightgbm_four_equal", "four_model_targets", "lightgbm_xgboost_blend",
                        "xgboost", "xgboost_tuning", "trade_unit", "min_trade_cost_cny", "lightgbm_tuning", "neutral_search",
-                       "listfold_mlp", "rank_pair_tuning", "ridge_strong_alphas", "log_evaluation_period"}
+                       "mlp", "listfold_mlp", "rank_pair_tuning", "ridge_strong_alphas", "log_evaluation_period"}
     if any(config.get(key) != saved.get(key) for key in (config.keys() | saved.keys()) - evaluation_keys):
         raise ValueError("配置与存档的滚动训练不匹配")
     test = predictions.loc[predictions.split.eq("test")]

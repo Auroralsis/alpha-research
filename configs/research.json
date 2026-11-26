@@ -14,7 +14,7 @@
       "2025-12-31"
     ]
   },
-  "walk_forward": {"initial_train_years": 3, "early_stop_years": 1, "validation_years": 1},
+  "walk_forward": {"selection_windows": "latest", "initial_train_years": 3, "early_stop_years": 1, "validation_years": 1},
   "feature_warmup_days": 60,
   "alpha158_processing": "mad",
   "label_start_days": 1,
@@ -41,9 +41,12 @@
       "bagging_freq": 1
     }
   },
-  "listfold_mlp": {
+  "mlp": {
+    "input_scaling": "none",
+    "regression_output": "zscore",
     "device": "cuda",
-    "hidden_sizes": [256, 512, 128, 32],
+    "hidden_sizes": [316, 158, 79],
+    "dropout": 0.5,
     "learning_rate": 0.001,
     "batch_days": 8,
     "updates": 1000,
@@ -76,12 +79,6 @@
     "avoid100": [0, 1, 7, 8, 9]
   },
   "four_model_weights": {"top50": 0.2, "top100": 0.2, "avoid50": 0.3, "avoid100": 0.3},
-  "six_grade_targets": {
-    "top50": [0, 2, 4, 6, 17, 19],
-    "top100": [0, 2, 4, 16, 17, 19],
-    "avoid50": [0, 12, 14, 16, 17, 19],
-    "avoid100": [0, 2, 14, 16, 17, 19]
-  },
   "lightgbm_four_equal": {
     "description": "四个 LambdaRank 模型共用以下参数，各自使用 four_model_targets 的一组增益。每天先转为排名百分位，再各占 25%。linear 只用作对照。",
     "params": {
@@ -109,25 +106,6 @@
     "description": "混合两类四模型等权分数。XGBoost 占以下比例，剩余部分给 LightGBM。",
     "xgboost_weight": 0.5
   },
-  "catrank_regressor": {
-    "loss_function": "RMSE", "iterations": 300, "depth": 3, "learning_rate": 0.05,
-    "l2_leaf_reg": 100, "rsm": 0.5, "bootstrap_type": "Bernoulli", "subsample": 0.8,
-    "border_count": 64, "thread_count": 16, "task_type": "CPU"
-  },
-  "single_catboost": {
-    "description": "A–D 分别训练一个按日分组的 CatBoost 排序器，直接使用四组真实增益。",
-    "params": {
-      "loss_function": "YetiRank:mode=NDCG;top=53;dcg_type=Base;dcg_denominator=LogPosition;permutations=1",
-      "eval_metric": "NDCG:top=50;type=Base;denominator=LogPosition",
-      "depth": 3, "learning_rate": 0.05, "l2_leaf_reg": 100,
-      "rsm": 0.5, "bootstrap_type": "Bernoulli", "subsample": 0.8,
-      "border_count": 64, "thread_count": 16, "task_type": "CPU"
-    }
-  },
-  "catboost_four_equal": {
-    "description": "四组排名各占 25%。用上一阶段选出的 LightGBM/XGBoost 组合为基线，再加入 CatBoost。",
-    "catboost_weight": 0.3333333333333333
-  },
   "num_boost_round": 1000,
   "early_stopping_rounds": 50,
   "topk": 50,
@@ -148,7 +126,7 @@
   "data": {
     "start_date": "20130901",
     "end_date": "20251231",
-    "market_end_date": "20260228",
+    "market_end_date": "20261120",
     "request_interval": 0.4
   },
   "ridge_solver": "cholesky",

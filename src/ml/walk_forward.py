@@ -18,6 +18,9 @@ def folds(cfg):
     end = pd.Timestamp(cfg["segments"]["validation"][1])
     if end >= pd.Timestamp(cfg["segments"]["test"][0]):
         raise ValueError("验证区间与测试期重叠")
+    if cfg.get("validation_mode"):
+        return [dict(train=cfg["segments"]["train"], early_stop=cfg["early_stop_bounds"],
+                     validation=cfg["segments"]["validation"])]
     policy = cfg["walk_forward"]
     initial = policy["initial_train_years"]
     stop_years = policy.get("early_stop_years")
@@ -35,16 +38,20 @@ def folds(cfg):
                            validation=[f"{valid}-01-01", valid_end]))
     if not result:
         raise ValueError("配置的历史范围容纳不下完整的首个验证窗口")
-    return result
+    # 旧归档未指定 selection_windows，复现时仍使用其全部历史验证窗。
+    mode = policy.get("selection_windows", "all")
+    if mode not in ("latest", "all"):
+        raise ValueError("selection_windows 可选 latest 或 all")
+    return result[-1:] if mode == "latest" else result
 
 
 def period(source, bounds, names, cfg, ranking, extra=None):
     if ranking:
-        frame = read_period(source, bounds, split_top25=cfg.get("split_top25", False))
+        frame = read_period(source, bounds, cfg)
         rows = frame.loc[frame.evaluable]
         target = rows.grade.to_numpy(dtype=int)
     else:
-        frame = read_feature_split(source / "features.parquet", bounds, "walk-forward")
+        frame = read_feature_split(source / "features.parquet", bounds, "walk-forward", cfg)
         mask = segment_masks(frame, {"period": bounds})["period"]
         target = fitting_targets(frame.loc[mask], cfg["training_label"])
         rows = frame.loc[target.index]
@@ -56,21 +63,9 @@ def period(source, bounds, names, cfg, ranking, extra=None):
     return rows[names], np.asarray(target), groups
 
 
-def fold_models(source, cfg, fold, family, params, names, ranking, extra=None):
-    blocks = [period(source, fold[part], names, cfg, ranking, extra) for part in ("train", "early_stop")]
-    if family == "catboost":
-        from catboost import CatBoostRanker, Pool
-
-        for name in BASES:
-            gains = np.asarray(cfg["label_gains"][name])
-            train, stop = [Pool(x, label=gains[y], group_id=np.repeat(np.arange(len(groups)), groups),
-                                thread_count=params["thread_count"]) for x, y, groups in blocks]
-            model = CatBoostRanker(**params, iterations=cfg["num_boost_round"], random_seed=cfg["seed"],
-                                   allow_writing_files=False)
-            model.fit(train, eval_set=stop, use_best_model=True, early_stopping_rounds=cfg["early_stopping_rounds"],
-                      verbose=False)
-            yield name, model, model.tree_count_
-        return
+def fold_models(source, cfg, fold, family, params, names, ranking, extra=None, *, targets=BASES, blocks=None):
+    if blocks is None:
+        blocks = [period(source, fold[part], names, cfg, ranking, extra) for part in ("train", "early_stop")]
     matrices = []
     for features, labels, groups in blocks:
         reference = matrices[0] if matrices else None
@@ -82,7 +77,7 @@ def fold_models(source, cfg, fold, family, params, names, ranking, extra=None):
         matrices.append(matrix)
     rounds = cfg["num_boost_round"]
     patience = cfg["early_stopping_rounds"]
-    for name in BASES if ranking else ("regression",):
+    for name in targets if ranking else ("regression",):
         gains = cfg["label_gains"][name] if ranking else None
         if family == "xgboost":
             for matrix, (_, grades, _) in zip(matrices, blocks):
@@ -110,9 +105,11 @@ def rank_predictions(out, cfg, options, *, names=None, fold_features=None, extra
     """按历史窗口重训并缓存每个候选的四目标等权排名。"""
     source = Path(cfg["feature_source"])
     names = alpha158_columns(source) if names is None else names
+    if extra is not None and fold_features is None:
+        names = list(dict.fromkeys([*names, *extra.columns]))
     for fold in folds(cfg):
         start, end = fold["validation"]
-        valid = read_period(source, fold["validation"], split_top25=cfg.get("split_top25", False))
+        valid = read_period(source, fold["validation"], cfg)
         if set(valid.loc[valid.evaluable, "trade_date"].dt.year) != set(range(int(start[:4]), int(end[:4]) + 1)):
             raise ValueError(f"验证窗口缺少有效年度数据 {start} 至 {end}")
         if extra is not None:
@@ -126,8 +123,11 @@ def rank_predictions(out, cfg, options, *, names=None, fold_features=None, extra
         for family, choices in options.items():
             ranks[family] = []
             for params in choices:
+                # 沿用历史五档标签实验的缓存键。
                 inputs = [params, fold, names, cfg["label_gains"], cfg["seed"], cfg["num_boost_round"],
-                          cfg["early_stopping_rounds"], cfg.get("split_top25", False), str(source.resolve())]
+                          cfg["early_stopping_rounds"], False, str(source.resolve())]
+                if cfg.get("label_end_days", 2) != 2:
+                    inputs.append(cfg["label_end_days"])
                 key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]
                 directory = out / "folds" / f"{fold['early_stop'][0]}_{start}_{end}" / family
                 directory.mkdir(parents=True, exist_ok=True)
@@ -140,8 +140,6 @@ def rank_predictions(out, cfg, options, *, names=None, fold_features=None, extra
                     for name, model, _ in fold_models(source, cfg, fold, family, params, names, True, extra):
                         if family == "xgboost":
                             scores[name] = model.inplace_predict(features)
-                        elif family == "catboost":
-                            scores[name] = model.predict(features, thread_count=params["thread_count"])
                         else:
                             scores[name] = model.predict(features, num_threads=params.get("num_threads"))
                     scores["score"] = equal_ranks(scores, list(BASES))
@@ -153,32 +151,23 @@ def rank_predictions(out, cfg, options, *, names=None, fold_features=None, extra
         yield fold, keys, ranks
 
 
-def rank_losses(out, cfg, options, weight, *, names=None, fold_features=None, extra=None):
+def rank_losses(out, cfg, options, weight=0.5, *, names=None, fold_features=None, extra=None):
     gains = {name: cfg["label_gains"][name] for name in BASES}
     records = []
     for fold, keys, ranks in rank_predictions(out, cfg, options, names=names, fold_features=fold_features, extra=extra):
         start, end = fold["validation"]
-        if "catboost" in ranks:
-            lightgbm, = ranks["lightgbm"]
-            xgboost, = ranks["xgboost"]
-            ranks["lightgbm"] = [(1 - weight) * lightgbm + weight * xgboost]
-            candidates = ranks["catboost"]
-            blend_weight = cfg["catboost_four_equal"]["catboost_weight"]
-            candidate_col = "cat_index"
-        else:
-            candidates = ranks["xgboost"]
-            blend_weight = weight
-            candidate_col = "xgb_index"
-        own_losses = [validation_loss(keys, score, gains, cfg["topk"]).loss.mean() for score in candidates]
+        bounds = dict(train_start=fold["train"][0], train_end=fold["train"][1],
+                      early_stop_start=fold["early_stop"][0], early_stop_end=fold["early_stop"][1],
+                      valid_start=start, valid_end=end)
+        right_scores = ranks.get("xgboost", [])
+        own_losses = [validation_loss(keys, score, gains, cfg["topk"]).loss.mean() for score in right_scores]
         for i, left in enumerate(ranks["lightgbm"]):
-            baseline = validation_loss(keys, left, gains, cfg["topk"]).loss.mean()
-            for j, right in enumerate(candidates):
-                daily = validation_loss(keys, (1 - blend_weight) * left + blend_weight * right, gains, cfg["topk"])
-                records.append(dict(light_index=i, **{candidate_col: j}, train_start=fold["train"][0], train_end=fold["train"][1],
-                                    early_stop_start=fold["early_stop"][0], early_stop_end=fold["early_stop"][1],
-                                    valid_start=start, valid_end=end, days=len(daily), baseline_loss=baseline,
+            light = validation_loss(keys, left, gains, cfg["topk"])
+            for j, right in enumerate(right_scores):
+                daily = validation_loss(keys, (1 - weight) * left + weight * right, gains, cfg["topk"])
+                records.append(dict(**bounds, light_index=i, xgb_index=j, days=len(daily), baseline_loss=light.loss.mean(),
                                     model_loss=own_losses[j], blend_loss=daily.loss.mean()))
     table = pd.DataFrame(records)
-    if not np.isfinite(table[["baseline_loss", "model_loss", "blend_loss"]]).all().all():
+    if not np.isfinite(table.filter(regex="_loss$")).all().all():
         raise ValueError("逐折排序损失不是有限数值")
     return table

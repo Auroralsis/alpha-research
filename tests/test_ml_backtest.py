@@ -34,10 +34,68 @@ def write_feature_spec(out: Path) -> None:
 
 
 class TrainingTests(unittest.TestCase):
+    def test_label_horizons_replace_cached_returns_before_cutoff(self):
+        from src.config import set_label_days
+        from src.data.research_panel import segment_masks
+
+        dates = pd.bdate_range("2020-12-10", periods=18)
+        close = pd.DataFrame({"a": np.arange(18) + 10.}, index=dates)
+        close.loc[dates[7], "a"] = np.nan
+        cached = pd.DataFrame({"trade_date": dates, "ticker": "a", "label": -99.})
+        bounds = [dates[0], dates[14]]
+        with TemporaryDirectory() as tmp, patch("src.ml.dataset.label_prices", return_value=close):
+            path = Path(tmp) / "features.parquet"
+            cached.to_parquet(path)
+            for days in (1, 5, 10):
+                cfg = {}
+                set_label_days(cfg, days)
+                frame = read_feature_split(path, bounds, "train", cfg)
+                self.assertEqual(frame.label_end_date.iloc[0], dates[1 + days])
+                self.assertAlmostEqual(frame.label.iloc[0], close.a.iloc[1 + days] / close.a.iloc[1] - 1)
+                self.assertTrue(pd.isna(frame.label.iloc[6]))
+                valid = segment_masks(frame, {"train": bounds})["train"]
+                self.assertEqual(frame.trade_date[valid].max(), dates[13 - days])
+                self.assertTrue(frame.label_end_date[valid].le(bounds[1]).all())
+            pd.testing.assert_frame_equal(pd.read_parquet(path), cached)
+
+    def test_composite_objective_scales_and_thresholds(self):
+        from src.ml.tree_experiment import composite_loss
+        self.assertAlmostEqual(composite_loss(.20, 1.5, -.10)["composite_loss"], -.6)
+        row = composite_loss(-.30, -1.5, -.30)
+        np.testing.assert_allclose((row["P_r"], row["P_s"], row["P_d"], row["P_floor"]), (3.375, 1.5, 1., 10.))
+        self.assertAlmostEqual(row["composite_loss"], 17.475)
+        at_threshold = composite_loss(-.20, 0., -.15)
+        self.assertEqual((at_threshold["P_d"], at_threshold["P_floor"]), (0., 0.))
+
+    def test_regime_weights_use_only_current_members_and_realized_history(self):
+        from src.scripts.regime_fusion import indicators
+
+        dates = pd.bdate_range("2022-01-01", periods=80)
+        close = pd.Series(100 + np.arange(80), index=dates)
+        prices = pd.DataFrame({"x": close, "y": 200 - close}, index=dates)
+        members = pd.DataFrame(True, index=dates, columns=prices.columns)
+        members.loc[dates[59], "y"] = False
+        state = indicators(close, prices, members)
+        self.assertEqual(state.loc[dates[59], "breadth20"], 1)
+        self.assertEqual(state.loc[dates[60], "breadth20"], .5)
+        self.assertEqual(state.loc[dates[58], "D"], .5)
+        self.assertEqual(state.loc[dates[59], "D"], .7)
+        self.assertTrue(state.iloc[:20][["E","F"]].eq(.5).all().all())
+        pd.testing.assert_frame_equal(state.iloc[:61], indicators(close.iloc[:61], prices.iloc[:61], members.iloc[:61]))
+        partial = prices.copy()
+        partial.loc[dates[57], "x"] = np.nan
+        missing = indicators(close, partial, members)
+        self.assertEqual(missing.loc[dates[59], "F"], .5)
+        self.assertEqual(missing.loc[dates[60], "coverage"], .5)
+
     def test_walk_forward_windows_and_label_cutoffs(self):
         from src.ml.walk_forward import folds, period
 
         cfg = load_config()
+        recent = folds(cfg)
+        self.assertEqual(recent, [dict(train=["2014-01-02", "2020-12-31"], early_stop=["2021-01-01", "2021-12-31"],
+                                       validation=["2022-01-01", "2022-12-31"])])
+        cfg["walk_forward"].pop("selection_windows")
         windows = folds(cfg)
         self.assertEqual(len(windows), 5)
         for year, window in enumerate(windows, 2017):
@@ -74,44 +132,190 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(fit.call_count, 4)
             self.assertEqual([n for _, _, n in models], [3 if family == "xgboost" else 2] * 4)
 
-    def test_cli_selects_requested_model_and_retains_old_imports(self):
+    def test_cli_selects_requested_model(self):
         from src.scripts.__main__ import main
-        from src.scripts import boosting, run_catboost, run_listfold_mlp, run_xgboost
 
-        self.assertIs(run_catboost.fit, boosting.fit_catboost)
-        self.assertIs(run_xgboost.train, boosting.train_xgboost)
-        with patch("src.scripts.run_listfold.run") as train:
-            main(["listfold", "--model", "mlp-ndcg"])
-            train.assert_called_once_with("mlp-ndcg")
-            run_listfold_mlp.main([])
-            self.assertEqual(train.call_args.args, ("mlp",))
+        with patch("src.ml.tree_experiment.model_run") as train:
+            main(["xgboost", "--loss", "rank:pairwise"])
+            args, families = train.call_args.args
+            self.assertEqual((args.xgboost_loss, families), ("rank:pairwise", ("xgboost",)))
+            main(["eight-rankers"])
+            self.assertEqual(train.call_args.args[1], ("lightgbm", "xgboost"))
+            main(["lightgbm", "--tpe"])
+            self.assertEqual(train.call_args.args[1], ("lightgbm",))
         with patch("src.scripts.run_all.main") as study:
-            main(["lightgbm", "--workers", "2"])
-            study.assert_called_once_with(["--workers", "2"], lightgbm_only=True)
+            main(["lightgbm", "--loss", "mse", "--workers", "2"])
+            self.assertEqual(study.call_args.args[0][-2:], ["--workers", "2"])
+            self.assertTrue(study.call_args.kwargs["lightgbm_only"])
 
-    def test_catrank_uses_same_day_average_ranks_and_preserves_unlabeled_stocks(self):
-        from unittest.mock import Mock
-        from src.scripts.catrank import cat_scores, merge_scores
+    def test_stability_objective_selects_consistent_candidate(self):
+        from src.ml.tuning import rank_stage_trials
 
-        frame = pd.DataFrame({
-            "trade_date": pd.to_datetime(["2020-01-02"]*4 + ["2020-01-03"]*2),
-            "ticker": ["d","c","a","b","a","d"],
-            "feature": [5,1,1,3,7,8],
-            "label": [float("nan"),0.1,0.2,0.3,0.4,0.5],
+        table = pd.DataFrame({
+            "lightgbm": ["volatile", "steady"] * 2, "xgboost": ["same"] * 4,
+            "valid_start": ["2018", "2018", "2019", "2019"], "days": [200, 200, 230, 230],
+            "blend_loss": [0.2, 0.45, 0.6, 0.45],
         })
-        model = Mock()
-        model.predict.return_value = frame.feature.to_numpy()
-        model.get_param.return_value = 1
-        ranking = cat_scores(model, frame, ["feature"])
-        np.testing.assert_allclose(ranking.CatRank, [1,1/6,1/6,2/3,0,1])
-        other = merge_scores(frame,ranking.iloc[::-1])
-        pd.testing.assert_series_equal(other.label,frame.label)
-        pd.testing.assert_series_equal(other.CatRank,ranking.CatRank)
-        with self.assertRaisesRegex(ValueError,"缺 CatRank"):
-            merge_scores(frame, ranking.iloc[1:])
+        ordinary, best_mean = rank_stage_trials(table, "depth", "lambdarank")
+        stable, best_stable = rank_stage_trials(table, "depth", "lambdarank_stable")
+        self.assertEqual(best_mean["lightgbm"], "volatile")
+        self.assertEqual(best_stable["lightgbm"], "steady")
+        np.testing.assert_allclose(ordinary.loss, [0.4, 0.45])
+        np.testing.assert_allclose(stable.std_loss, [0.2, 0.0])
+        np.testing.assert_allclose(stable.L_opt, [0.5, 0.45])
+
+    def test_standalone_lightgbm_equal_fixed_predictions(self):
+        from src.ml.rank_validation import BASES, equal_ranks
+        from src.scripts.__main__ import main
+
+        settings = load_config()
+        rng = np.random.default_rng(158)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_feature_spec(root)
+            frames = []
+            for year in range(2014, 2024):
+                frame = pd.DataFrame(rng.normal(size=(210, 158)), columns=FEATURE_NAMES)
+                for month in ([1, 4, 7, 10] if year == 2022 else [6]):
+                    frames.append(frame.assign(ticker=[f"S{i:03}" for i in range(210)],
+                                               trade_date=pd.Timestamp(year, month, 2), label=frame.F0,
+                                               label_end_date=pd.Timestamp(year, month, 4)))
+            pd.concat(frames).to_parquet(root / "features.parquet", index=False)
+            cfg = dict(feature_source=tmp, seed=158, final_early_stop_year=2021, topk=50, n_drop=5,
+                       segments=dict(train=["2014-01-01", "2020-12-31"], validation=["2022-01-01", "2022-12-31"],
+                                     test=["2023-01-01", "2023-12-31"]), walk_forward=settings["walk_forward"],
+                       num_boost_round=2, early_stopping_rounds=1, rebalance_days=1,
+                       label_gains=settings["four_model_targets"], rank_pair_tuning=dict(stages=["depth"], depth=[2]),
+                       lightgbm=dict(objective="lambdarank", metric="ndcg", eval_at=[50], max_depth=7,
+                                     learning_rate=.025, num_leaves=117, lambda_l1=7, lambda_l2=3,
+                                     colsample_bytree=.5, subsample=.8, bagging_freq=1, min_data_in_leaf=84,
+                                     num_threads=1, verbosity=-1, seed=158))
+            config = root / "config.json"
+            config.write_text(json.dumps(cfg))
+            with patch("src.scripts.train_lightgbm.evaluate_stack") as backtest, patch(
+                    "src.ml.walk_forward.xgb.train", side_effect=AssertionError("unexpected XGBoost training")):
+                out = root / "fixed"
+                main(["lightgbm-equal", "--config", str(config), "--out", str(out)])
+                scores, _, _, methods = backtest.call_args.args
+                self.assertEqual(methods, ("equal",))
+                np.testing.assert_allclose(scores.equal, equal_ranks(scores, list(BASES)))
+                self.assertEqual(len(list((out / "final").glob("*/lambdarank.txt"))), 4)
+                for mode, early_end, first in (("split", 2021, 2022), ("joint", 2022, 2021)):
+                    with self.subTest(mode=mode):
+                        folder = root / mode
+                        main(["lightgbm-equal", "--config", str(config), "--out", str(folder),
+                              "--validation-mode", mode])
+                        periods = json.loads((folder / "final/periods.json").read_text())
+                        self.assertEqual(periods[0]["end"], "2020-12-31")
+                        self.assertEqual(periods[1]["end"], f"{early_end}-12-31")
+                        self.assertLessEqual(periods[1]["last_label_end"], periods[1]["end"])
+                        scores = backtest.call_args.args[0]
+                        self.assertEqual(set(scores.loc[scores.split.eq("validation"), "trade_date"].dt.year),
+                                         set(range(first, 2023)))
+                        self.assertEqual(set(scores.loc[scores.split.eq("test"), "trade_date"].dt.year), {2023})
+
+    def test_fixed_optuna_selection_and_label_maturity(self):
+        from src.config import fixed_validation
+        from src.ml import tree_experiment as pair
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_feature_spec(root)
+            dates = ["2019-06-01", "2019-12-31", "2020-06-01", "2020-12-31", "2021-06-01", "2021-12-31", "2022-06-01", "2022-12-31"]
+            panel = pd.DataFrame(np.random.default_rng(8).normal(size=(210, 158)), columns=FEATURE_NAMES)
+            panel["ticker"] = [f"S{i}" for i in range(len(panel))]
+            panel["label"] = panel.F0
+            pd.concat([panel.assign(trade_date=pd.Timestamp(day), label_end_date=pd.Timestamp(day) +
+                                    pd.Timedelta(days=2)) for day in dates]).to_parquet(root / "features.parquet", index=False)
+            for mode in ("split", "joint"):
+                cfg = load_config()
+                fixed_validation(cfg, mode)
+                folder = root / mode
+                folder.mkdir()
+                cfg.update(feature_source=tmp, reference=tmp, topk=50, seed=158,
+                           num_boost_round=2, early_stopping_rounds=1, label_gains=cfg["four_model_targets"],
+                           lightgbm=dict(cfg["lightgbm_four_equal"]["params"], num_threads=1),
+                           xgboost=dict(cfg["xgboost"], nthread=1))
+                cfg["rank_pair_tpe"] = dict(lightgbm={"max_depth": ["int", 1, 10]},
+                                            xgboost={"max_depth": ["int", 1, 10]}, models="pair",
+                                            joint_validation=mode != "split", trials=1, startup_trials=1)
+                with self.subTest(mode=mode), patch.object(pair, "train_candidate", wraps=pair.train_candidate) as fit:
+                    winner = pair.tune_tpe(folder, cfg)
+                    self.assertEqual(set(winner), {"lightgbm", "xgboost"})
+                    self.assertEqual(len(fit.call_args_list), 2)
+                    for call in fit.call_args_list:
+                        train, early = call.args[4]
+                        self.assertEqual(len(train[0]), 630)
+                        self.assertEqual(len(early[0]), 210 if mode == "split" else 630)
+                    daily = pd.read_csv(folder / "validation_loss_daily.csv")
+                    eligible = ["2021-06-01", "2021-12-31", "2022-06-01"] if mode == "joint" else ["2022-06-01"]
+                    self.assertEqual(daily.trade_date.tolist(), eligible)
+
+    def test_model_entries_train_only_the_selected_rankers(self):
+        from src.ml.rank_validation import BASES, equal_ranks
+        from src.scripts.__main__ import main
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_feature_spec(root)
+            samples = pd.DataFrame(np.random.default_rng(8).normal(size=(211, 158)), columns=FEATURE_NAMES)
+            samples = samples.assign(ticker=[f"S{i:03}" for i in samples.index], label=samples.F0 / 100)
+            dates = pd.to_datetime(["2020-06-01", "2021-06-01", "2022-06-01", "2023-06-01"])
+            pd.concat([samples.assign(trade_date=d, label_end_date=d + pd.Timedelta(days=2))
+                       for d in dates], ignore_index=True).to_parquet(root / "features.parquet", index=False)
+            settings = json.loads(CONFIG_FILE.read_text())
+            settings.update(num_boost_round=2, early_stopping_rounds=1)
+            settings["single_xgboost"]["params"]["nthread"] = 1
+            settings["lightgbm_four_equal"]["params"]["num_threads"] = 1
+            settings["mlp"].update(device="cpu", cpu_threads=1, hidden_sizes=[4], updates=1, evaluate_every=1)
+            config = root / "config.json"
+            config.write_text(json.dumps(settings))
+            for command, loss in (("xgboost", "rank:pairwise"), ("eight-rankers", None), ("mlp", "lambdarank"), ("mlp", "mse")):
+                with self.subTest(command=command, loss=loss):
+                    folder = root / (command + str(loss).replace(":", "_"))
+                    argv = [command, "--config", str(config), "--source", tmp, "--out", str(folder)]
+                    if loss:
+                        argv.extend(["--loss", loss])
+                    with patch("src.ml.tree_experiment.evaluate_signals"), patch("src.scripts.train_mlp.evaluate_signals"):
+                        main(argv)
+                    frame = pd.read_parquet(folder / "predictions.parquet")
+                    self.assertEqual(set(frame.split), {"validation", "test"})
+                    if command == "mlp":
+                        self.assertEqual(len(list(folder.rglob("mlp.pt"))), 4 if loss == "lambdarank" else 1)
+                        if loss == "lambdarank":
+                            np.testing.assert_allclose(frame.mlp, equal_ranks(frame, list(BASES)))
+                        else:
+                            self.assertTrue(np.isfinite(frame.mlp).all())
+                    else:
+                        eight = command == "eight-rankers"
+                        self.assertEqual(len(list(folder.rglob("model.ubj"))), 4)
+                        self.assertEqual(len(list(folder.rglob("lambdarank.txt"))), 4 if eight else 0)
+                        columns = ["xgb_" + name for name in BASES] + (list(BASES) if eight else [])
+                        signal = frame.blend_equal if eight else frame.xgb_equal
+                        np.testing.assert_allclose(signal, equal_ranks(frame, columns))
+
+    def test_pair_default_uses_fixed_validation(self):
+        from src.ml import tree_experiment as pair
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref = root / "daily_xgboost_tuned_20261121_172019_402981"
+            ref.mkdir()
+            cfg = load_config()
+            cfg.update(label_gains=cfg["four_model_targets"], segments=dict(
+                train=["2014-01-02", "2020-12-31"], validation=["2022-01-01", "2022-12-31"],
+                test=["2023-01-01", "2025-12-31"]))
+            (ref / "config.json").write_text(json.dumps(cfg))
+            with patch.object(pair, "RUNS", root), patch.object(pair, "new_run", return_value=root / "out"), patch.object(
+                    pair, "tune", return_value={}) as tune, patch.object(pair, "evaluate"):
+                pair.main([])
+            actual = tune.call_args.args[1]
+            self.assertNotIn("walk_forward", actual)
+            self.assertEqual(tuple(actual["rank_pair_tuning"]["stages"]), pair.STAGES)
+            self.assertEqual(actual["segments"], cfg["segments"])
 
     def test_pair_tuning_keeps_incumbent_and_uses_effective_leaf_limits(self):
-        from src.scripts.run_pair_tuning import candidates
+        from src.ml.tree_experiment import candidates
 
         grid = {"leaf_cap_fractions": [0.5, 1], "min_child_weight": [1, 10]}
         lightgbm = {"max_depth": 5, "num_leaves": 117}
@@ -124,8 +328,8 @@ class TrainingTests(unittest.TestCase):
                          [xgboost, {**xgboost, "min_child_weight": 1}])
 
     def test_xgb_grid_uses_only_training_early_stop_and_validation(self):
-        from src.scripts.run_rank_stack import BASES
-        from src.scripts.run_xgboost import train
+        from src.scripts.train_lightgbm import BASES
+        from src.scripts.compare_tree_models import train_xgboost
 
         cfg = load_config()
         cfg.pop("walk_forward")  # 单验证期历史归档
@@ -152,14 +356,14 @@ class TrainingTests(unittest.TestCase):
             (out / "final/periods.json").write_text(json.dumps(periods))
             pd.concat(counts).to_csv(out / "final/grade_counts.csv")
             with patch("src.ml.rank_validation.read_period", side_effect=lambda _, bounds, **kwargs: frames[bounds[0]]) as fixed_read:
-                fixed_models = train(out, cfg, out, ["signal"], out)
+                fixed_models = train_xgboost(out, cfg, out, ["signal"], out)
             self.assertEqual(set(fixed_models), set(BASES))
             self.assertEqual([call.args[1][0] for call in fixed_read.call_args_list], list(frames)[:2])
             self.assertNotIn("selected_trial", cfg)
             self.assertFalse((out / "trials.csv").exists())
             cfg["xgboost_tuning"] = {"search_space": {"max_depth": [2, 3]}}
-            with patch("src.ml.rank_validation.read_period", side_effect=lambda _, bounds, *, split_top25=False: frames[bounds[0]]) as read:
-                models = train(out, cfg, out, ["signal"], out, tune=True)
+            with patch("src.ml.rank_validation.read_period", side_effect=lambda _, bounds, **kwargs: frames[bounds[0]]) as read:
+                models = train_xgboost(out, cfg, out, ["signal"], out, tune=True)
             self.assertEqual([call.args[1][0] for call in read.call_args_list], list(frames))
             trials = pd.read_csv(out / "trials.csv")
             losses = pd.read_csv(out / "blend_trials.csv").set_index("trial").blend_loss
@@ -171,41 +375,16 @@ class TrainingTests(unittest.TestCase):
                 self.assertEqual(models[name].num_boosted_rounds(), winners.at[name, "rounds"])
                 self.assertTrue((out / f"{name}.ubj").is_file())
 
-    def test_catboost_saves_four_rankers_without_reading_test(self):
-        from catboost import CatBoostRanker
-        from src.scripts.run_catboost import fit
-        from src.scripts.run_rank_stack import BASES
+    def test_zscore_fusion_keeps_daily_score_distances_and_equal_weights(self):
+        from src.ml.rank_validation import fuse_rankers
 
-        cfg = load_config()
-        cfg.update(label_gains=cfg["four_model_targets"], num_boost_round=3, early_stopping_rounds=2)
-        cfg["single_catboost"]["params"].update(thread_count=1, depth=2)
-        frames, periods, counts = {}, [], []
-        for split, year in (("train", 2020), ("early_stop", 2021), ("validation", 2022)):
-            days = pd.date_range(f"{year}-01-06", periods=3)
-            bounds = [str(day.date()) for day in (days[0], days[-1])]
-            x = np.random.default_rng(year).normal(size=300)
-            frame = pd.DataFrame(dict(trade_date=days.repeat(100), ticker=np.tile(np.arange(100), 3),
-                                      grade=np.tile(np.arange(5), 60), label_end_date=days.repeat(100),
-                                      evaluable=True, signal=x))
-            frames[bounds[0]] = frame
-            if split == "validation":
-                cfg["segments"]["validation"] = bounds
-            else:
-                periods.append(dict(period=split, start=bounds[0], end=bounds[1], stock_days=len(frame),
-                                    last_label_end=bounds[1]))
-                counts.append(pd.crosstab(frame.trade_date, frame.grade).assign(period=split))
-        with TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            cfg["reference"] = str(out)
-            (out / "final").mkdir()
-            (out / "final/periods.json").write_text(json.dumps(periods))
-            pd.concat(counts).to_csv(out / "final/grade_counts.csv")
-            with patch("src.ml.rank_validation.read_period", side_effect=lambda _, bounds, *, split_top25=False: frames[bounds[0]]):
-                fit(cfg, out, ["signal"], out, tune=False)
-            saved = pd.read_parquet(out / "trial_0/validation.parquet")
-            for name in BASES:
-                model = CatBoostRanker().load_model(str(out / "trial_0" / f"{name}.cbm"))
-                np.testing.assert_allclose(saved[name], model.predict(frame[["signal"]], thread_count=1))
+        frame = pd.DataFrame({"trade_date": [1, 1, 1, 2], "a": [1., 2., 15., 200.],
+                              "b": [3., 2., 1., 300.], "constant": [4.] * 4})
+        score = fuse_rankers(frame, ["a", "b", "constant"], "zscore")
+        first = frame.iloc[:3][["a", "b"]]
+        expected = ((first - first.mean()) / first.std()).sum(axis=1) / 3
+        np.testing.assert_allclose(score.iloc[:3], expected)
+        self.assertEqual(score.iloc[3], 0.)
 
     def test_final_rank_loss_uses_one_list_for_all_targets(self):
         from src.ml.rank_validation import equal_ranks, validation_loss
@@ -224,8 +403,8 @@ class TrainingTests(unittest.TestCase):
         self.assertAlmostEqual(loss.loss.iloc[0], 1-(1/5+4/5)/2)
 
     def test_paired_rankings_use_daily_scores_and_ticker_tiebreak(self):
-        from src.scripts.run_xgboost import paired_signals
-        from src.scripts.run_rank_stack import BASES
+        from src.scripts.compare_tree_models import paired_signals
+        from src.scripts.train_lightgbm import BASES
 
         frame = pd.DataFrame(dict(trade_date=[1, 1, 1, 2, 2, 2], ticker=list("CABABC"), split="test"))
         for name in (*BASES, "equal"):
@@ -237,7 +416,7 @@ class TrainingTests(unittest.TestCase):
         np.testing.assert_allclose(result.spearman, [np.sqrt(3) / 2, -1])
 
     def test_ranking_targets_reset_daily_and_preserve_ties(self):
-        from src.scripts.run_lambdarank import relevance, ranking_diagnostics
+        from src.scripts.compare_rank_labels import relevance, ranking_diagnostics
 
         frame = pd.DataFrame(dict(trade_date=[1, 1, 1, 1, 2, 2, 2], ticker=list("ABCDABC"),
                                   label=[3., 2., 2., 0., .2, .1, np.nan], split="test",
@@ -251,7 +430,7 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(daily.at[(2, "mse"), "n_scored"], 2)
 
     def test_graded_relevance_spreads_the_tail_without_changing_head_evaluation(self):
-        from src.scripts.run_lambdarank import relevance, ranking_diagnostics
+        from src.scripts.compare_rank_labels import relevance, ranking_diagnostics
 
         frame = pd.DataFrame(dict(trade_date=[1]*6 + [2]*2, ticker=list("ABCDEFAB"),
                                   label=[6., 5., 4., 3., 2., 1., .1, .1], evaluable=True, split="test"))
@@ -262,7 +441,7 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(daily.at[1, "ndcg"], 0.)
 
     def test_quantile_target_is_daily_linear_and_keeps_tied_returns_together(self):
-        from src.scripts.run_lambdarank import quantile_relevance
+        from src.scripts.compare_rank_labels import quantile_relevance
 
         frame = pd.DataFrame({"trade_date": [1] * 10 + [2] * 5 + [3] * 3,
                               "label": list(range(10)) + [8., 1., 1., 5., 6.] + [.01] * 3})
@@ -278,7 +457,7 @@ class TrainingTests(unittest.TestCase):
                 pd.testing.assert_series_equal(quantile_relevance(shuffled, grades).sort_index(), ranked)
 
     def test_bottom_target_and_execution_day_holdings(self):
-        from src.scripts.run_lambdarank import bottom_relevance, holding_bottom_rates
+        from src.scripts.compare_rank_labels import bottom_relevance, holding_bottom_rates
 
         dates = pd.bdate_range("2024-01-04", periods=3)
         values = pd.DataFrame(dict(trade_date=[dates[0]] * 5 + [dates[1]] * 2,
@@ -292,7 +471,7 @@ class TrainingTests(unittest.TestCase):
         self.assertTrue(pd.isna(rates.at[dates[2], "held_bottom_rate"]))
 
     def test_fixed_grades_include_boundary_ties_and_reset_by_day(self):
-        from src.scripts.run_rank_stack import fixed_grades
+        from src.ml.rank_validation import fixed_grades
 
         label = np.arange(300)
         label[50] = label[49]
@@ -302,15 +481,12 @@ class TrainingTests(unittest.TestCase):
         grade = fixed_grades(frame.sample(frac=1, random_state=17)).sort_index()
         np.testing.assert_array_equal(grade[:300], grade[300:])
         self.assertEqual(grade[:300].value_counts().sort_index().tolist(), [51, 49, 100, 49, 51])
-        six = fixed_grades(frame.sample(frac=1, random_state=21), split_top25=True).sort_index()
-        pd.testing.assert_series_equal(six.clip(upper=4), grade)
-        self.assertEqual(six[:300].value_counts().sort_index().tolist(), [51, 49, 100, 49, 25, 26])
-        np.testing.assert_array_equal(six[:300], six[300:])
         with self.assertRaisesRegex(ValueError, "重叠"):
             fixed_grades(frame.iloc[:150])
 
     def test_rank_blend_rewards_agreement_and_limits_each_vote(self):
-        from src.scripts.run_rank_stack import BASES, fit_rank_blend, rank_inputs
+        from src.scripts.compare_tree_models import fit_rank_blend
+        from src.scripts.train_lightgbm import BASES, rank_inputs
 
         oof = pd.DataFrame(dict(trade_date=np.repeat([1, 2], 12), label=np.tile(np.arange(12), 2), evaluable=True))
         for name in BASES:
@@ -325,7 +501,7 @@ class TrainingTests(unittest.TestCase):
         pd.testing.assert_series_equal(w, fit_rank_blend(oof.assign(label=oof.label ** 3), .15, .35))
 
     def test_stack_ranks_include_stocks_with_no_future_label(self):
-        from src.scripts.run_rank_stack import BASES, rank_inputs
+        from src.scripts.train_lightgbm import BASES, rank_inputs
 
         scores = pd.DataFrame(dict(trade_date=[1, 1, 1, 2], evaluable=[True, False, True, True]))
         for name in BASES:
@@ -347,8 +523,7 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(training_settings(config)["lightgbm_params"]["max_depth"], 2)
             self.assertEqual(config["lightgbm_four_equal"]["params"]["max_depth"], 4)
             self.assertEqual(config["xgboost"]["max_depth"], 6)
-            self.assertNotIn("tuning", config["catboost_four_equal"])
-            for section in ("lightgbm_tuning", "xgboost_tuning", "rank_pair_tuning", "catboost_tuning",
+            for section in ("lightgbm_tuning", "xgboost_tuning", "rank_pair_tuning",
                             "ridge_strong_alphas", "lambdarank_bottom_gaps"):
                 self.assertNotIn(section, config)
                 self.assertTrue(load_tuning(section, config))
@@ -362,19 +537,19 @@ class TrainingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = Path(tmp)
             path = out / "tuning.json"
-            custom_grid = {"search_space": {"l2_leaf_reg": [75]}}
-            path.write_text(json.dumps({"catboost_tuning": custom_grid}))
+            custom_grid = {"search_space": {"min_child_weight": [75]}}
+            path.write_text(json.dumps({"xgboost_tuning": custom_grid}))
             config = load_config()
-            old_grid = {"search_space": {"l2_leaf_reg": [250]}}
-            config["catboost_four_equal"]["tuning"] = old_grid
-            self.assertEqual(load_tuning("catboost_tuning", config), old_grid)
-            self.assertEqual(load_tuning("catboost_tuning", config, path), custom_grid)
+            old_grid = {"search_space": {"min_child_weight": [250]}}
+            config["xgboost_tuning"] = old_grid
+            self.assertEqual(load_tuning("xgboost_tuning", config), old_grid)
+            self.assertEqual(load_tuning("xgboost_tuning", config, path), custom_grid)
             with self.assertRaisesRegex(ValueError, "lightgbm_tuning"):
                 load_tuning("lightgbm_tuning", config, path)
             config["lightgbm_tuning"] = {"search_space": {"max_depth": [3]}}
             write_best_config(out, config)
             self.assertEqual(load_config(out / "best_config.json"), load_config())
-            self.assertIn("tuning", config["catboost_four_equal"])
+            self.assertEqual(config["xgboost_tuning"], old_grid)
 
     def test_unified_configuration_keeps_training_controls_out_of_model_params(self):
         config = load_config()
@@ -631,7 +806,7 @@ def rolling_fixture():
                      "Requires requirements.txt")
 class RollingWindowTests(unittest.TestCase):
     def test_rank_pair_expands_from_fixed_start_and_preserves_partial_test_years(self):
-        from src.scripts.run_pair_tuning import expanding_years
+        from src.ml.tree_experiment import expanding_years
 
         windows = dict(expanding_years({"train": ["2014-01-02", "2020-12-31"],
                                         "test": ["2023-04-03", "2025-08-20"]}))
@@ -647,7 +822,7 @@ class RollingWindowTests(unittest.TestCase):
                                   "test": ["2023-04-03", "2025-08-20"]}))
 
     def test_sliding_pair_advances_both_training_boundaries(self):
-        from src.scripts.run_pair_tuning import expanding_years
+        from src.ml.tree_experiment import expanding_years
 
         segments = {"train": ["2014-01-02", "2020-12-31"], "test": ["2023-01-01", "2025-12-31"]}
         expanding = dict(expanding_years(segments))
@@ -660,7 +835,7 @@ class RollingWindowTests(unittest.TestCase):
 
     def test_expanding_pair_purges_late_training_labels_and_scores_unlabeled_stocks(self):
         from src.ml.rank_validation import BASES
-        from src.scripts.run_pair_tuning import expanding_window, expanding_years
+        from src.ml.tree_experiment import expanding_window, expanding_years
 
         bounds = dict(expanding_years({"train": ["2014-01-02", "2020-12-31"],
                                        "test": ["2023-01-01", "2023-12-31"]}))[2023]
@@ -682,8 +857,8 @@ class RollingWindowTests(unittest.TestCase):
             out = Path(tmp)
             pd.concat(frames, ignore_index=True).to_parquet(out / "features.parquet")
             cfg = dict(feature_source=tmp, lightgbm={}, xgboost={})
-            with (patch("src.scripts.run_pair_tuning.train_candidate", side_effect=fit) as train,
-                  patch("src.scripts.run_pair_tuning.quantile_matrices", return_value=[])):
+            with (patch("src.ml.tree_experiment.train_candidate", side_effect=fit) as train,
+                  patch("src.ml.tree_experiment.quantile_matrices", return_value=[])):
                 scores = expanding_window(out, cfg, 2023, bounds, ["feature"])
             self.assertEqual(train.call_count, 2)
             self.assertTrue(scores.label.isna().all())

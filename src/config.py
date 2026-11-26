@@ -24,11 +24,8 @@ def walk_forward_policy(settings: dict) -> dict:
 
 def load_tuning(section: str, settings: dict, path: Path | None = None) -> dict | list:
     """仅在调参时读取候选，兼容旧实验配置内嵌的网格。"""
-    if path is None:
-        if section in settings:
-            return settings[section]
-        if section == "catboost_tuning" and "tuning" in settings.get("catboost_four_equal", {}):
-            return settings["catboost_four_equal"]["tuning"]
+    if path is None and section in settings:
+        return settings[section]
     source = path or TUNING_FILE
     document = json.loads(source.read_text(encoding="utf-8"))
     if section not in document:
@@ -55,6 +52,8 @@ def rebalance_frequency(days: int) -> tuple[str, str]:
 def load_config(path: Path = CONFIG_FILE) -> dict:
     """读取训练、标签、交易、运行和下载参数。"""
     config = json.loads(path.read_text(encoding="utf-8"))
+    if "listfold_mlp" in config:
+        config.setdefault("mlp", config.pop("listfold_mlp"))
     # 将面向读者的实验分组展开为训练端的参数；旧实验快照本身已是展开格式。
     if "single_lightgbm" in config:
         single = config.pop("single_lightgbm")
@@ -81,6 +80,7 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
     if config.get("alpha158_processing", "raw") not in ("raw", "mad", "neutral"):
         raise ValueError("alpha158_processing 必须为 raw、mad 或 neutral")
     rebalance_frequency(config["rebalance_days"])
+    set_label_days(config)
     if not 0 < config["label_start_days"] < config["label_end_days"]:
         raise ValueError("标签偏移必须满足 0 < label_start_days < label_end_days")
     config["training_label"] = normalize_training_label(config.get("training_label"))
@@ -144,3 +144,39 @@ def write_best_config(out: Path, config: dict) -> None:
         if key in fixed:
             fixed[key] = {k: v for k, v in fixed[key].items() if k != "tuning"}
     (out / "best_config.json").write_text(json.dumps(fixed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def label_argument(parser):
+    parser.add_argument("--label-days", type=int, choices=(1, 5, 10),
+                        help="从 T+1 收盘起计算未来几个交易日的收益标签")
+
+
+def set_label_days(cfg, days=None):
+    """显式选择持有期时从次日收盘开始；旧配置沿用原端点。"""
+    days = cfg.get("label_days") if days is None else days
+    if days is not None:
+        if type(days) is not int or days not in (1, 5, 10):
+            raise ValueError("label_days 须为 1、5 或 10")
+        cfg.update(label_days=days, label_start_days=1, label_end_days=1 + days)
+
+
+def validation_argument(parser):
+    """为新训练提供统一的固定验证期选项。"""
+    parser.add_argument("--validation-mode", choices=("split", "joint"),
+                        help="split：2021 早停、2022 选参；joint：共用 2021–2022")
+
+
+def fixed_validation(cfg, mode):
+    """选择固定实验的早停和选参区间，训练集与测试集边界取自实验配置。"""
+    if mode is None:
+        return
+    if mode not in ("split", "joint"):
+        raise ValueError(f"未知固定验证模式 {mode}")
+    segments = cfg["segments"]
+    if segments["train"][1] != "2020-12-31" or segments["test"][0] <= "2022-12-31":
+        raise ValueError("固定验证要求训练截止 2020 年末、测试始于 2023 年或之后")
+    cfg["validation_mode"] = mode
+    cfg["early_stop_bounds"] = ["2021-01-01", "2022-12-31" if mode == "joint" else "2021-12-31"]
+    cfg["final_early_stop_year"] = int(cfg["early_stop_bounds"][1][:4])
+    segments["validation"] = ["2021-01-01" if mode == "joint" else "2022-01-01", "2022-12-31"]
+    cfg.pop("walk_forward", None)

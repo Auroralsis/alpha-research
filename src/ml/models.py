@@ -112,9 +112,9 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
     feature_audit, split_audit = [], {}
     ridge = ridge_pipeline(config, config["ridge_alpha"]) if include_ridge else None
 
-    def load(split: str) -> pd.DataFrame:
+    def load(split: str, bounds=None) -> pd.DataFrame:
         """读取一个阶段的股票日特征，并记录缺失值与标签覆盖情况。"""
-        bounds = config["segments"][split]
+        bounds = bounds or config["segments"][split]
         end = pd.Timestamp(bounds[1])
         rows = read_feature_split(out / "features.parquet", bounds, split)
         values = rows[names].to_numpy(dtype=np.float32)
@@ -132,11 +132,13 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
 
     fitting, ridge_mse = {}, {}
     for split, qlib_segment_name in (("train", "train"), ("validation", "valid")):
-        frame = load(split)
-        mask = segment_masks(frame, config["segments"])[split]
+        bounds = config.get("early_stop_bounds", config["segments"][split]) if split == "validation" else config["segments"][split]
+        audit_name = "early_stop" if split == "validation" and config.get("early_stop_bounds") != config["segments"][split] and config.get("validation_mode") else split
+        frame = load(audit_name, bounds)
+        mask = segment_masks(frame, {split: bounds})[split]
         fitting[qlib_segment_name], target = fitting_segment(frame, names, mask, settings["training_label"], split)
         dropped_days = frame.loc[mask & ~frame.index.isin(target.index), "trade_date"]
-        split_audit[split].update(purged_label_rows=int(mask.sum()), fitted_rows=len(target),
+        split_audit[audit_name].update(purged_label_rows=int(mask.sum()), fitted_rows=len(target),
                                   degenerate_label_days=dropped_days.nunique(), degenerate_label_rows=len(dropped_days))
         if split == "train" and ridge is not None:
             ridge_features = fitting["train"]["feature"].to_numpy(dtype=np.float32)
@@ -150,6 +152,10 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
     if ridge is not None:
         joblib.dump(ridge, models / "ridge.joblib")
     validation = frame
+    if config.get("early_stop_bounds", config["segments"]["validation"]) != config["segments"]["validation"]:
+        validation = load("validation")
+        mask = segment_masks(validation, config["segments"])["validation"]
+        validation_target = fitting_targets(validation.loc[mask], settings["training_label"])
     del frame
 
     predictions = []
@@ -192,7 +198,7 @@ def train_and_predict(config: dict, out: Path, *, include_ridge: bool = True) ->
     predictions.to_parquet(out / "predictions.parquet", index=False)
     pd.DataFrame(feature_audit).to_csv(out / "feature_coverage.csv", index=False)
     log = dict(**settings, **rank_metrics, best_iteration=best, trained_rounds=len(curve), lightgbm_version=lgb.__version__,
-               split_audit=split_audit)
+               early_stop_bounds=config.get("early_stop_bounds", config["segments"]["validation"]), split_audit=split_audit)
     if ridge is not None:
         log.update(ridge_training_label=settings["training_label"], ridge_mse=ridge_mse)
     (out / "training_log.json").write_text(json.dumps(log, indent=2) + "\n")
@@ -235,7 +241,7 @@ def compare_ridge(config: dict, cache: Path, out: Path) -> pd.DataFrame:
 
     def fitting_data(split, bounds=None):
         bounds = segments[split] if bounds is None else bounds
-        rows = read_feature_split(path, bounds, split)
+        rows = read_feature_split(path, bounds, split, config)
         eligible = rows.loc[segment_masks(rows, {split: bounds})[split]]
         target = fitting_targets(eligible, config["training_label"])
         rows = rows.loc[target.index]
@@ -292,7 +298,7 @@ def compare_ridge(config: dict, cache: Path, out: Path) -> pd.DataFrame:
         write_best_config(out, dict(config, ridge_alpha=float(best)))
         parts = []
         for split in ("validation", "test"):
-            rows = read_feature_split(path, segments[split], split)
+            rows = read_feature_split(path, segments[split], split, config)
             result = rows[["trade_date", "ticker", "label"]].copy()
             features = transform.transform(rows[names])
             result["ridge_strong"] = models[best][-1].predict(features)

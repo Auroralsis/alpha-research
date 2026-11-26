@@ -13,7 +13,7 @@ def mad_clip(values: ArrayLike, multiple: float = 5) -> pd.Series:
     values = pd.Series(values, copy=True, dtype=float)
     median = values.median()
     mad = (values - median).abs().median()
-    # A zero MAD does not justify destroying the remaining cross-sectional spread.
+    # MAD 为零时保留原值，避免抹去仍然存在的截面差异。
     return values if not np.isfinite(mad) or mad == 0 else values.clip(median - multiple * mad, median + multiple * mad)
 
 

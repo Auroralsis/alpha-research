@@ -1,6 +1,7 @@
 """把项目的股票日特征与收益接到 Qlib DatasetH。"""
 
 import json
+from functools import lru_cache
 from collections.abc import Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +14,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 
 from src.data.download import write_parquet_batches
 from src.data.research_panel import (
-    CSI500_INPUTS as INPUTS, ResearchPanel, execution_labels, prepare_membership, prepare_panel,
+    CSI500_INPUTS as INPUTS, ResearchPanel, execution_labels, labels_from_close, load_market_calendar, prepare_membership, prepare_panel,
     segment_masks, stock_day_index,
 )
 from src.factors import factor_batches
@@ -118,12 +119,40 @@ def alpha158_columns(out: Path) -> list[str]:
     return names
 
 
-def read_feature_split(path: Path, bounds: Sequence, split: str) -> pd.DataFrame:
+@lru_cache(maxsize=1)
+def label_prices():
+    """各训练窗口共用复权收盘价，旧特征归档只读。"""
+    dates = load_market_calendar(INPUTS["calendar"])
+    return prepare_panel(pd.read_parquet(INPUTS["prices"]), dates).matrix("close_adj")
+
+
+def standardize_daily_features(rows, names):
+    """按完整当日股票池逐列标准化，缺失和无截面差异的因子值记为零。"""
+    values = rows[names].to_numpy(dtype=np.float32, copy=True)
+    for positions in rows.groupby("trade_date", sort=False).indices.values():
+        day = values[positions].astype(np.float64)
+        observed = np.isfinite(day)
+        count = observed.sum(axis=0).clip(min=1)
+        mean = np.where(observed, day, 0).sum(axis=0) / count
+        centered = np.where(observed, day - mean, 0)
+        std = np.sqrt(np.square(centered).sum(axis=0) / count)
+        values[positions] = centered / np.where(std > 0, std, 1)
+    rows.loc[:, names] = values
+
+
+def read_feature_split(path: Path, bounds: Sequence, split: str, cfg=None) -> pd.DataFrame:
     """从特征表读取指定区间并检查股票日键。"""
     begin, end = map(pd.Timestamp, bounds)
     rows = pd.read_parquet(path, filters=[("trade_date", ">=", begin), ("trade_date", "<=", end)])
     if rows.empty or rows.duplicated(["trade_date", "ticker"]).any():
         raise ValueError(f"Empty or duplicated feature rows in {split}")
+    if cfg and ("label_days" in cfg or cfg.get("label_end_days", 2) != 2 or cfg.get("label_start_days", 1) != 1):
+        keys = rows[["trade_date", "ticker"]]
+        labels = labels_from_close(label_prices(), keys, cfg["label_start_days"], cfg["label_end_days"])
+        for column in ("label_start_date", "label_end_date", "label"):
+            rows[column] = labels[column]
+    if cfg and cfg.get("mlp_input_scaling") == "daily_zscore":
+        standardize_daily_features(rows, alpha158_columns(path.parent))
     return rows
 
 

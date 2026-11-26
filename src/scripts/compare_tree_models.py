@@ -1,4 +1,4 @@
-"""XGBoost、CatBoost 四目标排序和树模型组合对照。"""
+"""比较树模型的分数、融合权重与堆叠方法。"""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ import xgboost as xgb
 
 from src.backtest.engine import evaluate_signals
 from src.backtest.factor_metrics import daily_ic
-from src.config import walk_forward_policy, CONFIG_FILE, load_config, load_tuning, with_model_params, write_best_config
+from src.config import label_argument, set_label_days, CONFIG_FILE, fixed_validation, load_config, load_tuning, validation_argument, walk_forward_policy, with_model_params, write_best_config
 from src.data.research_panel import ROOT, stock_day_index
 from src.ml.dataset import alpha158_columns
 from src.ml import rank_validation
@@ -18,7 +18,11 @@ from src.ml.rank_validation import (
     BASES, aligned_reference, candidates_from_grid, equal_ranks, training_periods, validation_loss,
 )
 from src.scripts.run_all import RUNS, latest_run, new_run
-from src.scripts.run_rank_stack import evaluate_stack
+from scipy.optimize import minimize
+from sklearn.linear_model import LogisticRegression
+from src.ml.rank_validation import METHODS, read_period
+from src.scripts.train_lightgbm import evaluate_stack, frozen_lightgbm, rank_inputs, score, train_fold
+from src.scripts.train_xgboost import fit_target
 
 
 def verify_baseline_returns(out, reference, strategy):
@@ -28,18 +32,6 @@ def verify_baseline_returns(out, reference, strategy):
         return ledger.set_index(["trade_date", "offset"]).daily_return.sort_index()
 
     pd.testing.assert_series_equal(returns(out), returns(reference), atol=1e-10, rtol=1e-10)
-
-
-def fit_target(params: dict, cfg: dict, train_set: xgb.DMatrix, early_stop: xgb.DMatrix):
-    """在本组标签上训练，用早停期选出的轮数截取模型和记录曲线。"""
-    history = {}
-    model = xgb.train(params, train_set, cfg["num_boost_round"], evals=[(early_stop, "early_stop")],
-                      early_stopping_rounds=cfg["early_stopping_rounds"], maximize=True,
-                      evals_result=history, verbose_eval=False)
-    rounds = model.best_iteration + 1
-    curve = pd.Series(history["early_stop"][params["eval_metric"]], name="ndcg_at_50")
-    curve.index = pd.RangeIndex(1, len(curve) + 1, name="iteration")
-    return model[:rounds], curve
 
 
 def blend_validation(frame, baseline, weight, gains, k, baseline_loss):
@@ -73,7 +65,7 @@ def train_xgboost(reference: Path, cfg: dict, source: Path, names: list[str], ou
         cfg.update(xgboost=candidates[selected], selected_trial=selected)
         return train_xgboost(reference, cfg, source, names, out)
     matrices, grades = [], []
-    for _, rows, sizes in training_periods(source, reference, cfg["segments"], split_top25=cfg.get("split_top25", False)):
+    for _, rows, sizes in training_periods(source, reference, cfg["segments"], cfg.get("early_stop_bounds"), cfg):
         matrix = xgb.QuantileDMatrix(rows[names], group=sizes,
                                      ref=matrices[0] if matrices else None, max_bin=params.get("max_bin", 256),
                                      nthread=params["nthread"])
@@ -85,14 +77,15 @@ def train_xgboost(reference: Path, cfg: dict, source: Path, names: list[str], ou
     if tune:
         space = cfg["xgboost_tuning"]["search_space"]
         candidates = candidates_from_grid(params, space)
-        frame = rank_validation.read_period(source, cfg["segments"]["validation"], split_top25=cfg.get("split_top25", False))
+        frame = rank_validation.read_period(source, cfg["segments"]["validation"], cfg=cfg)
         rows = frame.loc[frame.evaluable]
         validation = xgb.DMatrix(rows[names], group=rows.groupby("trade_date", sort=False).size().to_numpy(),
                                  nthread=params["nthread"])
         matrices.append(validation)
         grades.append(rows.grade.to_numpy(dtype=int))
         validation_keys = frame[["trade_date", "ticker", "grade", "evaluable"]].copy()
-        validation_keys["reference"] = aligned_reference(reference, frame, "validation", ["equal"])["equal"]
+        validation_keys["reference"] = (frozen_lightgbm(reference, frame, cfg).equal if cfg.get("early_stop_bounds") or cfg.get("label_end_days", 2) != 2
+                                        else aligned_reference(reference, frame, "validation", ["equal"]).equal)
         validation_features = frame[names]
         weight = cfg.get("lightgbm_xgboost_blend", {}).get("xgboost_weight", 0.5)
         gains = {name: cfg["label_gains"][name] for name in BASES}
@@ -144,18 +137,22 @@ def predict_xgboost(reference: Path, cfg: dict, source: Path, names: list[str], 
     keys = ["trade_date", "ticker"]
     chunks = []
     for split in ("validation", "test"):
-        frame = rank_validation.read_period(source, cfg["segments"][split])
+        frame = rank_validation.read_period(source, cfg["segments"][split], cfg=cfg)
         scored = frame[keys + ["label", "label_end_date", "grade", "evaluable"]].copy()
         matrix = frame[names]
         for name in BASES:
             scored[f"xgb_{name}"] = models[name].inplace_predict(matrix)
+        if cfg.get("early_stop_bounds") or cfg.get("label_end_days", 2) != 2:
+            scored = scored.join(frozen_lightgbm(reference, frame, cfg))
         chunks.append(scored.assign(split=split))
         del frame, matrix
     scores = pd.concat(chunks).set_index(["split", *keys], verify_integrity=True).sort_index()
-    old = pd.read_parquet(reference / "predictions.parquet").set_index(scores.index.names, verify_integrity=True).sort_index()
-    pd.testing.assert_frame_equal(old[["label", "label_end_date", "grade", "evaluable"]],
-                                  scores[["label", "label_end_date", "grade", "evaluable"]])
-    scores = scores.join(old[[*BASES, "equal"]]).reset_index()
+    if not cfg.get("early_stop_bounds") and cfg.get("label_end_days", 2) == 2:
+        old = pd.read_parquet(reference / "predictions.parquet").set_index(scores.index.names, verify_integrity=True).sort_index()
+        pd.testing.assert_frame_equal(old[["label", "label_end_date", "grade", "evaluable"]],
+                                      scores[["label", "label_end_date", "grade", "evaluable"]])
+        scores = scores.join(old[[*BASES, "equal"]])
+    scores = scores.reset_index()
     xcols = [f"xgb_{name}" for name in BASES]
     if not np.isfinite(scores[[*BASES, *xcols]].to_numpy()).all():
         raise ValueError("配对模型存在无效分数")
@@ -262,11 +259,17 @@ def xgboost_main(argv=None) -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--tune", action="store_true", help="以最终混合分数的验证损失选择共享参数")
     mode.add_argument("--reweight", action="store_true", help="用归档预测比较 four_model_weights 与原等权配置")
+    label_argument(parser)
+    validation_argument(parser)
     args = parser.parse_args(argv)
     if args.tuning_config and not args.tune:
         parser.error("--tuning-config 需要同时指定 --tune")
     settings = load_config(args.config)
+    if args.reweight and args.label_days is not None:
+        parser.error("归档重配权重沿用原训练标签")
     if args.reweight:
+        if args.validation_mode:
+            parser.error("归档重配权重沿用原验证窗口")
         reference = args.reference or latest_run("top50.ubj", "blend_trials.csv", "ledger.parquet", rebalance_days=1)
         print(compare_target_weights(reference, settings["four_model_weights"]))
         return
@@ -276,6 +279,7 @@ def xgboost_main(argv=None) -> None:
     cfg = json.loads((reference / "config.json").read_text())
     source = Path(cfg["feature_source"])
     names = alpha158_columns(source)
+    set_label_days(cfg, args.label_days if args.label_days is not None else settings.get("label_days"))
     for key in ("num_boost_round", "early_stopping_rounds", "seed"):
         cfg[key] = settings[key]
     if "four_model_targets" in settings and any(
@@ -299,6 +303,7 @@ def xgboost_main(argv=None) -> None:
         tunable = {"max_depth", "min_child_weight", "reg_alpha", "reg_lambda", "subsample", "colsample_bytree", "learning_rate"}
         if not space or not space.keys() <= tunable & cfg["xgboost"].keys() or not all(space.values()):
             raise ValueError("xgboost_tuning.search_space 需要有效的树结构、正则化、采样率或学习率候选")
+    fixed_validation(cfg, args.validation_mode or settings.get("validation_mode") or cfg.get("validation_mode"))
     cfg.update(xgboost_version=xgb.__version__, reference=str(reference))
     cfg.pop("neutral_search", None)
     out = new_run(cfg["rebalance_days"], tag="xgboost_tuned" if args.tune else "xgboost")
@@ -308,227 +313,203 @@ def xgboost_main(argv=None) -> None:
     models = train_xgboost(reference, cfg, source, names, out, tune=args.tune)
     if args.tune:
         selected = with_model_params(requested, "xgboost", cfg["xgboost"])
+        set_label_days(selected, cfg.get("label_days"))
+        fixed_validation(selected, cfg.get("validation_mode"))
         write_best_config(out, selected)
         (out / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     predict_xgboost(reference, cfg, source, names, models, out)
     print(evaluate_xgboost(out), flush=True)
 
 
-def fit_catboost(cfg, source, names, out, tune):
-    """训练候选并保存各组的验证分数。选参之前只读训练、早停和验证样本。"""
-    from catboost import CatBoostRanker, Pool
-
-    params = cfg["single_catboost"]["params"]
-    space = cfg["catboost_four_equal"]["tuning"]["search_space"] if tune else {}
-    candidates = candidates_from_grid(params, space)
-    if tune and cfg.get("walk_forward", {}).get("early_stop_years"):
-        from src.ml.walk_forward import rank_losses
-
-        options = {"lightgbm": [cfg["lightgbm"]], "xgboost": [cfg["xgboost"]], "catboost": candidates}
-        table = rank_losses(out, cfg, options, cfg["lightgbm_xgboost_blend"]["xgboost_weight"])
-        table.rename(columns={"cat_index": "trial"}).to_csv(out / "fold_trials.csv", index=False)
-    split_data = []
-    for _, rows, _sizes in training_periods(source, Path(cfg["reference"]), cfg["segments"], split_top25=cfg.get("split_top25", False)):
-        split_data.append((rows[names], rows.grade.to_numpy(dtype=int), pd.factorize(rows.trade_date)[0]))
-        del rows
-    valid = rank_validation.read_period(source, cfg["segments"]["validation"], split_top25=cfg.get("split_top25", False))
-    logs = []
-    for number, candidate in enumerate(candidates):
-        directory = out / f"trial_{number}"
-        directory.mkdir(exist_ok=True)
-        (directory / "params.json").write_text(json.dumps(candidate, indent=2))
-        scores = valid[["trade_date", "ticker", "grade", "evaluable"]].copy()
-        for name in BASES:
-            gains = np.array(cfg["label_gains"][name])
-            train, stop = [Pool(data, label=gains[grade], group_id=groups, thread_count=params["thread_count"])
-                           for data, grade, groups in split_data]
-            model = CatBoostRanker(**candidate, iterations=cfg["num_boost_round"], random_seed=cfg["seed"],
-                                   allow_writing_files=False)
-            model.fit(train, eval_set=stop, use_best_model=True, early_stopping_rounds=cfg["early_stopping_rounds"],
-                      verbose=False)
-            model.save_model(str(directory / f"{name}.cbm"))
-            scores[name] = model.predict(valid[names], thread_count=params["thread_count"])
-            curves = model.get_evals_result()["validation"]
-            metric = next(key for key in curves if key.startswith("NDCG:") and "top=50" in key.split(":")[1].split(";"))
-            curve = pd.Series(curves[metric], index=pd.RangeIndex(1, len(curves[metric])+1, name="iteration"), name="ndcg_at_50")
-            curve.to_csv(directory / f"{name}_early_stop.csv")
-            logs.append(dict(trial=number, target=name, rounds=model.tree_count_,
-                             early_stop_ndcg=curve.loc[model.tree_count_],
-                             **{key: candidate[key] for key in space}))
-            pd.DataFrame(logs).to_csv(out / "training.csv", index=False)
-            print(f"CatBoost 候选 {number} {name} 最佳轮数 {model.tree_count_}", flush=True)
-            del train, stop
-        scores.to_parquet(directory / "validation.parquet", index=False)
+def fit_rank_blend(oof: pd.DataFrame, lower: float, upper: float) -> pd.Series:
+    """用样本外分数拟合真实收益百分位，每日等权，限制四个正权重的范围与总和。"""
+    inputs = rank_inputs(oof).loc[oof.evaluable]
+    valid = oof.loc[oof.evaluable]
+    by_date = valid.groupby("trade_date").label
+    target = by_date.rank(method="average", pct=True).to_numpy()
+    x = inputs.to_numpy()
+    if not (np.isfinite(x).all() and np.isfinite(target).all() and len(x)):
+        raise ValueError("拟合需要有限的股票日预测与收益")
+    sample_weight = 1 / (by_date.transform("size").to_numpy() * by_date.ngroups)
+    gram = (x.T * sample_weight) @ x
+    cross = x.T @ (sample_weight * target)
+    result = minimize(lambda w: w @ gram @ w - 2 * w @ cross, np.full(len(BASES), 1 / len(BASES)),
+                      jac=lambda w: 2 * (gram @ w - cross), method="SLSQP",
+                      bounds=[(lower, upper)] * len(BASES),
+                      constraints=[dict(type="eq", fun=lambda w: w.sum() - 1)],
+                      options={"ftol": 1e-14})
+    if not result.success or not np.isclose(result.x.sum(), 1):
+        raise RuntimeError(f"权重拟合失败：{result.message}")
+    return pd.Series(result.x, index=BASES, name="weight")
 
 
-def score_candidate(cfg, directory):
-    """用指定归档的四个模型打分，并与冻结的双模型分数合并。"""
-    from catboost import CatBoostRanker
+def run_blend(source: Path) -> Path:
+    """复用已冻结的四列基础预测，与原等权及逻辑回归比较连续排名堆叠。"""
+    cfg = json.loads((source / "config.json").read_text())
+    oof = pd.read_parquet(source / "oof_predictions.parquet")
+    valid = oof.loc[oof.evaluable]
+    if (set(oof.trade_date.dt.year) != set(cfg["oof_years"]) or
+            not valid.label_end_date.dt.year.eq(valid.trade_date.dt.year).all() or
+            valid.label_end_date.max() >= pd.Timestamp(cfg["segments"]["validation"][0])):
+        raise ValueError("样本外预测日期或标签终点越界")
+    lower, upper = 0.15, 0.35
+    weights = fit_rank_blend(oof, lower, upper)
+    cfg["rank_blend"] = dict(source=str(source.resolve()), lower=lower, upper=upper, weights=weights.to_dict(),
+                             fit_stock_days=len(valid), fit_dates=valid.trade_date.nunique(),
+                             target="daily_return_percentile", loss="day_equal_weighted_mse")
+    scores = pd.read_parquet(source / "predictions.parquet")
+    ranks = rank_inputs(scores)
+    np.testing.assert_allclose(ranks.mean(axis=1), scores.equal, rtol=0, atol=1e-12)
+    scores["blend"] = ranks @ weights
+    out = new_run(cfg["rebalance_days"], tag="rank_blend")
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
+    print(out, weights.to_dict(), flush=True)
+    methods = ("equal", "logistic", "blend")
+    evaluate_stack(scores, cfg, out, methods)
+    old = pd.read_parquet(source / "ledger.parquet")
+    new = pd.read_parquet(out / "ledger.parquet")
+    keys = ["strategy", "trade_date", "offset"]
+    for name in ("equal", "logistic"):
+        pd.testing.assert_frame_equal(old.loc[old.strategy.eq(name)].set_index(keys).sort_index(),
+                                      new.loc[new.strategy.eq(name)].set_index(keys).sort_index(),
+                                      rtol=1e-10, atol=1e-10)
+    from src.report.rank_stack import write_blend_report
+    return write_blend_report(out)
 
+
+def run_equal_seed(reference: Path, seed: int, validation_mode=None, label_days=None) -> Path:
+    """只更换基础模型种子，训练四个排名模型并与存档等权预测配对回测。"""
+    cfg = json.loads((reference / "config.json").read_text())
+    fixed_validation(cfg, validation_mode)
+    set_label_days(cfg, label_days)
+    cfg["seed"] = cfg["lightgbm"]["seed"] = seed
+    cfg["equal_reference"] = str(reference.resolve())
+    out = new_run(cfg["rebalance_days"], tag=f"equal_seed_{seed}")
+    out.mkdir()
+    print(out, flush=True)
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
     source = Path(cfg["feature_source"])
-    ref = Path(cfg["xgboost_reference"])
-    names = alpha158_columns(source)
-    w = cfg["catboost_four_equal"]["catboost_weight"]
-    scored = []
+    features = alpha158_columns(source)
+    models = train_fold(source, cfg, features, cfg["final_early_stop_year"], BASES, out / "final")
+    pieces = []
     for split in ("validation", "test"):
-        frame = rank_validation.read_period(source, cfg["segments"][split])
-        scores = frame[["trade_date", "ticker", "grade", "label", "evaluable"]].copy()
-        refs = aligned_reference(ref, frame, split, [*BASES, "equal", "xgb_equal", "blend_equal",
-                                                      *["xgb_"+n for n in BASES]])
-        scores = scores.join(refs)
-        cat_names = []
-        for name in BASES:
-            key = "cat_"+name
-            model = CatBoostRanker().load_model(str(directory / f"{name}.cbm"))
-            scores[key] = model.predict(frame[names], thread_count=cfg["catboost"]["thread_count"])
-            cat_names.append(key)
-        scores["cat_equal"] = equal_ranks(scores, cat_names)
-        scores["three_equal"] = scores.blend_equal*(1-w) + scores.cat_equal*w
-        scored.append(scores.assign(split=split))
-    return pd.concat(scored, ignore_index=True)
+        frame = read_period(source, cfg["segments"][split], cfg=cfg)
+        scores = score(frame, features, models, cfg["lightgbm"]["num_threads"])
+        scores["equal"] = rank_inputs(scores).mean(axis=1)
+        if validation_mode:
+            scores["reference"] = frozen_lightgbm(reference, frame, cfg).equal.to_numpy()
+        pieces.append(scores.assign(split=split))
+        del frame
+    keys = ["split", "trade_date", "ticker"]
+    scores = pd.concat(pieces).set_index(keys).sort_index()
+    archived = pd.read_parquet(reference / "predictions.parquet",
+                               columns=keys + ["equal", "evaluable", "label"]).set_index(keys).sort_index()
+    if not validation_mode:
+        if label_days is None:
+            pd.testing.assert_frame_equal(scores[["evaluable", "label"]], archived[["evaluable", "label"]])
+        scores["reference"] = archived.equal
+    scores = scores.reset_index()
+    methods = ("reference", "equal")
+    evaluate_stack(scores, cfg, out, methods)
+
+    lists = []
+    for name in methods:
+        picks = scores.sort_values(["trade_date", name, "ticker"], ascending=[True, False, True])
+        lists.append(picks.groupby("trade_date").head(cfg["topk"])[keys])
+    intersection = lists[0].merge(lists[1], on=keys, validate="one_to_one")
+    groups = ["split", "trade_date"]
+    overlap = lists[0].groupby(groups).size().to_frame("picks")
+    overlap["common"] = intersection.groupby(groups).size().reindex(overlap.index, fill_value=0)
+    overlap["share"] = overlap.common / overlap.picks
+    overlap.to_csv(out / "overlap_daily.csv")
+
+    old = pd.read_parquet(reference / "ledger.parquet", filters=[("strategy", "==", "equal")])
+    replay = pd.read_parquet(out / "ledger.parquet", filters=[("strategy", "==", "reference")])
+    pd.testing.assert_frame_equal(old.drop(columns="strategy").reset_index(drop=True),
+                                  replay.drop(columns="strategy").reset_index(drop=True), rtol=1e-10, atol=1e-10)
+    from src.report.rank_stack import write_seed_report
+    return write_seed_report(out)
 
 
-def evaluate_catboost(out):
-    """先以验证集冻结候选，再预测测试集，并按相同 Qlib 规则回测。"""
-    cfg = json.loads((out / "config.json").read_text())
-    ref = Path(cfg["xgboost_reference"])
-    w = cfg["catboost_four_equal"]["catboost_weight"]
-    gains = {name: cfg["label_gains"][name] for name in BASES}
-    k = cfg["topk"]
-    best_loss = np.inf
-    trials = []
-    space = cfg["catboost_four_equal"]["tuning"]["search_space"] if cfg["catboost_tuned"] else {}
-    candidates = candidates_from_grid(cfg["single_catboost"]["params"], space)
-    for number, params in enumerate(candidates):
-        folder = out / f"trial_{number}"
-        if json.loads((folder / "params.json").read_text()) != params:
-            raise ValueError("候选的实际参数与实验配置不一致")
-        frame = pd.read_parquet(folder / "validation.parquet")
-        base = aligned_reference(ref, frame, "validation", ["blend_equal"]).blend_equal
-        base_loss = validation_loss(frame, base, gains, k).loss.mean()
-        daily, metrics = blend_validation(frame, base, w, gains, k, base_loss)
-        daily.to_csv(folder / "blend_loss_daily.csv", index=False)
-        loss = metrics["blend_loss"]
-        trials.append(dict(trial=number, **metrics, **params))
-        if loss < best_loss:
-            best_loss, best = loss, number
-    table = pd.DataFrame(trials)
-    fixed_validation = table.set_index("trial")
-    if cfg["catboost_tuned"] and cfg.get("walk_forward", {}).get("early_stop_years"):
-        detail = pd.read_csv(out / "fold_trials.csv")
-        summary = detail.groupby("trial")[["baseline_loss", "model_loss", "blend_loss"]].mean()
-        summary["days"] = detail.groupby("trial").days.sum()
-        summary["delta_vs_reference"] = summary.blend_loss - summary.baseline_loss
-        table = fixed_validation.drop(columns=summary.columns).join(summary, validate="one_to_one").reset_index()
-        best = int(summary.blend_loss.idxmin())
-    table.to_csv(out / "blend_trials.csv", index=False)
-    directory = out / f"trial_{best}"
-    xgb_config = json.loads((ref / "config.json").read_text())
-    cfg["xgboost"] = xgb_config["xgboost"]
-    cfg["xgboost_selected_trial"] = xgb_config.get("selected_trial")
-    cfg.update(selected_trial=best, catboost=json.loads((directory / "params.json").read_text()))
-    cfg["four_model_targets"] = gains
-    (out / "config.json").write_text(json.dumps(cfg, indent=2))
-    base_config = json.loads((ref / "best_config.json").read_text())
-    base_config.update({key: cfg[key] for key in ("seed", "num_boost_round", "early_stopping_rounds",
-                                                  "single_catboost", "catboost_four_equal", "four_model_targets")})
-    selected = with_model_params(base_config, "catboost", cfg["catboost"])
-    write_best_config(out, selected)
-    scores = score_candidate(cfg, directory)
-    valid = scores.loc[scores.split.eq("validation")]
-    check = validation_loss(valid, valid.three_equal, gains, k)
-    np.testing.assert_allclose(check.loss.mean(), fixed_validation.at[best, "blend_loss"], rtol=0, atol=1e-12)
-    losses = {name: validation_loss(valid, valid[name], gains, k).loss.mean()
-              for name in ("blend_equal", "cat_equal")}
-    losses["three_equal"] = check.loss.mean()
-    np.testing.assert_allclose(list(losses.values()), fixed_validation.loc[best, ["baseline_loss", "model_loss", "blend_loss"]]
-                               .to_numpy(dtype=float), rtol=0, atol=1e-12)
-    pd.Series(losses, name="loss").rename_axis("strategy").to_csv(out / "validation_losses.csv")
-    scores.to_parquet(out / "predictions.parquet", index=False)
-    pairs = pd.concat([paired_signals(scores, k, prefix, "cat_").assign(reference=family)
-                       for prefix, family in (("", "LightGBM"), ("xgb_", "XGBoost"))])
-    pairs.to_csv(out / "paired_daily.csv", index=False)
-    methods = (*["cat_" + name for name in BASES], "equal", "xgb_equal", "blend_equal", "cat_equal", "three_equal")
-    evaluate_signals(scores, cfg, out, methods)
-    verify_baseline_returns(out, ref, "blend_equal")
-    from src.report.rank_stack import write_catboost_report
-    return write_catboost_report(out)
-
-
-def replay_candidate(archive: Path, trial: int):
-    """复用已训练的指定候选，用相同账本比较单独与混合的测试表现。"""
-    cfg = json.loads((archive / "config.json").read_text())
-    directory = archive / f"trial_{trial}"
-    cfg["catboost"] = json.loads((directory / "params.json").read_text())
-    if cfg["selected_trial"] == trial:
-        from src.report.rank_stack import write_catboost_report
-        return write_catboost_report(archive)
-    cfg["validation_selected_trial"] = cfg.pop("selected_trial")
-    cfg["single_catboost"]["params"] = cfg["catboost"]
-    chosen = pd.read_csv(archive / "blend_trials.csv").set_index("trial").loc[trial]
-    out = new_run(cfg["rebalance_days"], tag="catboost_replay")
-    out.mkdir()
-    print(out, flush=True)
-    cfg.update(replayed_trial=trial, model_archive=str(archive))
-    (out / "config.json").write_text(json.dumps(cfg, indent=2))
-    scores = score_candidate(cfg, directory)
-    methods = ("blend_equal", "cat_equal", "three_equal")
-    valid = scores.loc[scores.split.eq("validation")]
-    gains = {name: cfg["label_gains"][name] for name in BASES}
-    if cfg.get("walk_forward", {}).get("early_stop_years") and cfg["catboost_tuned"]:
-        chosen = pd.read_csv(directory / "blend_loss_daily.csv").mean(numeric_only=True)
-        np.testing.assert_allclose(validation_loss(valid, valid.three_equal, gains, cfg["topk"]).loss.mean(), chosen.loss)
-    else:
-        for name, col in zip(methods, ("baseline_loss", "model_loss", "blend_loss")):
-            loss = validation_loss(valid, valid[name], gains, cfg["topk"])
-            np.testing.assert_allclose(loss.loss.mean(), chosen[col], rtol=0, atol=1e-12)
-    scores.to_parquet(out / "predictions.parquet", index=False)
-    evaluate_signals(scores, cfg, out, methods)
-    from src.report.rank_stack import write_catboost_replay
-    return write_catboost_replay(out)
-
-
-def catboost_main(argv=None):
-    parser = argparse.ArgumentParser(description='比较 CatBoost 四组排序信号及其加入 LightGBM/XGBoost 后的验证损失。')
-    parser.add_argument("--config", type=Path, default=CONFIG_FILE)
-    parser.add_argument("--xgboost-run", type=Path, help="按混合验证损失选参的 XGBoost 实验")
-    parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--tuning-config", type=Path, help="配合 --tune 指定候选网格，默认 configs/tuning.json")
-    parser.add_argument("--fit-only", action="store_true", help="保存全部候选，可在两模型基线完成后评价")
-    parser.add_argument("--evaluate", type=Path, help="使用已训练的 CatBoost 候选继续选参与评价")
-    parser.add_argument("--trial", type=int, help="按候选编号单独回放，和 --evaluate 一起使用")
-    args = parser.parse_args(argv)
-    if args.tuning_config and (not args.tune or args.evaluate):
-        parser.error("--tuning-config 仅用于 --tune 新实验")
-    if args.evaluate:
-        archive = args.evaluate.resolve()
-        print(evaluate_catboost(archive) if args.trial is None else replay_candidate(archive, args.trial))
-        return
-    if args.trial is not None:
-        parser.error("--trial 需要 --evaluate 指定原调参实验")
-    import catboost
-
-    settings = load_config(args.config)
-    ref = (args.xgboost_run or latest_run("top50.ubj", "blend_trials.csv", "predictions.parquet", "ledger.parquet", rebalance_days=1)).resolve()
-    cfg = json.loads((ref / "config.json").read_text())
-    if any(settings["four_model_targets"][name] != cfg["label_gains"][name] for name in BASES):
-        raise ValueError("CatBoost 与基线的四组增益不同")
-    cfg.pop("selected_trial", None)
-    for key in ("single_catboost", "catboost_four_equal", "seed", "num_boost_round", "early_stopping_rounds"):
+def run(source: Path, historical: Path, config_path: Path = CONFIG_FILE, validation_mode=None, label_days=None) -> Path:
+    """冻结样本外逻辑回归与最终基础模型，再进行统一诊断与回测。"""
+    metadata = json.loads((historical / "source.json").read_text())
+    if Path(metadata["baseline"]).resolve() != source.resolve() or metadata["target"] != "daily_quintile_gap3_relevance":
+        raise ValueError("历史对照必须来自相同特征和参数来源的五等分间距3实验")
+    cfg = load_config(source / "best_config.json")
+    if cfg["topk"] != 50 or cfg["rebalance_days"] != 1:
+        raise ValueError("本实验按日频 Top-50 设计")
+    cfg["segments"]["validation"] = ["2022-01-01", "2022-12-31"]
+    fixed_validation(cfg, validation_mode)
+    settings = load_config(config_path)
+    set_label_days(cfg, label_days if label_days is not None else settings.get("label_days"))
+    for key in ("seed", "num_boost_round", "early_stopping_rounds"):
         cfg[key] = settings[key]
-    cfg.pop("walk_forward", None)
-    if args.tune:
-        cfg["walk_forward"] = walk_forward_policy(settings)
-        cfg["catboost_four_equal"]["tuning"] = load_tuning("catboost_tuning", settings, args.tuning_config)
-    weight = cfg["catboost_four_equal"]["catboost_weight"]
-    if not 0 <= weight <= 1:
-        raise ValueError("catboost_weight 须在 0 至 1 之间")
-    cfg.update(xgboost_reference=str(ref), catboost_version=catboost.__version__, catboost_tuned=args.tune)
-    out = new_run(cfg["rebalance_days"], tag="catboost")
+    cfg["lightgbm"] = dict(settings["lightgbm_four_equal"]["params"], seed=cfg["seed"])
+    gains = dict(settings["four_model_targets"], linear=list(range(5)))
+    cfg.update(label_gains=gains, oof_years=[2018, 2019, 2020], final_early_stop_year=2021,
+               stack_C=1.0, feature_source=str(source.resolve()), historical_reference=str(historical.resolve()))
+    out = new_run(1, tag="rank_stack")
     out.mkdir()
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     print(out, flush=True)
-    source = Path(cfg["feature_source"])
-    fit_catboost(cfg, source, alpha158_columns(source), out, args.tune)
-    if not args.fit_only:
-        print(evaluate_catboost(out))
+    features = alpha158_columns(source)
+    threads = cfg["lightgbm"]["num_threads"]
+    pieces = []
+    for year in cfg["oof_years"]:
+        print(f"开始 {year} 年样本外预测", flush=True)
+        models = train_fold(source, cfg, features, year - 1, BASES, out / str(year))
+        frame = read_period(source, [f"{year}-01-01", f"{year}-12-31"], cfg=cfg)
+        pieces.append(score(frame, features, models, threads))
+        del frame, models
+    oof = pd.concat(pieces, ignore_index=True)
+    oof.to_parquet(out / "oof_predictions.parquet", index=False)
+    model = LogisticRegression(C=cfg["stack_C"], solver="lbfgs", max_iter=1000)
+    model.fit(rank_inputs(oof).loc[oof.evaluable], oof.loc[oof.evaluable, "grade"].eq(4).astype(int))
+    fitted = dict(intercept=model.intercept_[0], coefficients=dict(zip(BASES, model.coef_[0])),
+                  n_fit=int(oof.evaluable.sum()))
+    (out / "logistic.json").write_text(json.dumps(fitted, indent=2))
+    del oof, pieces
+    models = train_fold(source, cfg, features, cfg["final_early_stop_year"], gains, out / "final")
+    pieces = []
+    for split in ("validation", "test"):
+        frame = read_period(source, cfg["segments"][split], cfg=cfg)
+        predicted = score(frame, features, models, threads)
+        ranks = rank_inputs(predicted)
+        predicted["equal"] = ranks.mean(axis=1)
+        predicted["logistic"] = model.predict_proba(ranks)[:, 1]
+        pieces.append(predicted.assign(split=split))
+        del frame
+    scores = pd.concat(pieces, ignore_index=True)
+    evaluate_stack(scores, cfg, out, METHODS)
+    from src.report.rank_stack import write_report
+    return write_report(out)
+
+
+def stack_main(argv=None):
+    parser = argparse.ArgumentParser(description='用固定排名五档比较四种排序目标及跨年度样本外堆叠。')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--source", type=Path)
+    mode.add_argument("--blend-from", type=Path, help="从已有四模型的样本外预测拟合连续排名堆叠")
+    mode.add_argument("--equal-seed-from", type=Path, help="采用四模型等权，与原实验比较一个新种子")
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--historical", type=Path)
+    parser.add_argument("--config", type=Path, help="新训练读取的四模型等权配置")
+    label_argument(parser)
+    validation_argument(parser)
+    args = parser.parse_args(argv)
+    if args.config and not args.source:
+        parser.error("--config 适用于 --source 新训练，归档重放使用该次实验的配置")
+    if args.equal_seed_from and args.seed is not None and not args.historical:
+        print(run_equal_seed(args.equal_seed_from, args.seed, args.validation_mode, args.label_days))
+    elif args.seed is not None or args.equal_seed_from:
+        parser.error("--equal-seed-from 需配合 --seed，不使用 --historical")
+    elif args.blend_from and not args.historical:
+        if args.validation_mode or args.label_days is not None:
+            parser.error("归档融合沿用原训练窗口")
+        print(run_blend(args.blend_from))
+    elif args.source and args.historical:
+        print(run(args.source, args.historical, args.config or CONFIG_FILE, args.validation_mode, args.label_days))
+    else:
+        parser.error("--historical 仅与 --source 成对使用")

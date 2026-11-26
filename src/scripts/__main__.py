@@ -6,20 +6,18 @@ from importlib import import_module
 # 延迟导入使查看帮助和运行单个任务只加载所需模块。
 COMMANDS = {
     "study": ("run_all", "main", "综合研究、验证集调参和归档复评"),
-    "lightgbm": ("run_all", "lightgbm_main", "固定 LightGBM 与指数比较"),
-    "alpha101": ("factors", "alpha101_main", "Alpha101 单因子检验"),
-    "industry-reversal": ("industry_reversal", "main", "在固定树模型的前两档检验五日行业相对反转"),
-    "factor-ranking": ("factors", "ranking_main", "比较 Alpha101、Alpha158 及合并特征"),
-    "equal-weight": ("factors", "equal_weight_main", "Alpha158 因子等权和 Ridge 对照"),
-    "lambdarank": ("run_lambdarank", "main", "比较排序标签和增益"),
-    "rank-stack": ("run_rank_stack", "main", "四目标排序、等权与堆叠"),
-    "six-grades": ("run_rank_stack", "six_grades_main", "比较五档和六档排序"),
-    "xgboost": ("boosting", "xgboost_main", "XGBoost 与 LightGBM 排名组合"),
-    "catrank": ("catrank", "main", "逐年生成 CatRank 并比较八树基线、九票和第159列"),
-    "catboost": ("boosting", "catboost_main", "CatBoost 候选、组合及回放"),
-    "rolling-pair": ("run_pair_tuning", "rolling_pair_main", "按年用扩展或滑动窗口重训 LightGBM 与 XGBoost 等权组合"),
-    "pair-tuning": ("run_pair_tuning", "main", "按五折组合排名损失联合调优八个 LightGBM/XGBoost 排序器"),
-    "listfold": ("run_listfold", "main", "ListFold 与四目标 MLP；用 --model 选择"),
+    "lightgbm": ("train_lightgbm", "main", "LightGBM 四等权排序或 MSE 回归"),
+    "lambdarank": ("compare_rank_labels", "main", "比较排序标签和增益"),
+    "eight-rankers": ("train_eight_rankers", "main", "LightGBM + XGBoost 八排序器等权"),
+    "xgboost": ("train_xgboost", "main", "独立 XGBoost 四排序器等权"),
+    "regime-fusion": ("regime_fusion", "main", "复用四个排序器评价六种市场状态融合方案"),
+    "lightgbm-equal": ("train_lightgbm", "equal_main", "LightGBM 四目标等权训练、选参与回测"),
+    "rank-stack": ("compare_tree_models", "stack_main", "四目标排序、等权与堆叠"),
+    "xgboost-compare": ("compare_tree_models", "xgboost_main", "XGBoost 与 LightGBM 排名组合"),
+    "rolling-pair": ("ml.tree_experiment", "rolling_pair_main", "按年用扩展或滑动窗口重训 LightGBM 与 XGBoost 等权组合"),
+    "pair-tuning": ("ml.tree_experiment", "main", "按验证期组合排名损失联合调优八个 LightGBM/XGBoost 排序器"),
+    "tra": ("run_tra", "main", "Alpha158 时序 TRA 与冻结树模型的五组对照"),
+    "mlp": ("train_mlp", "main", "MLP 固定或滚动训练"),
 }
 
 
@@ -34,7 +32,8 @@ def main(argv=None):
         return
     task = parser.parse_args(args[:1]).task
     module, entry, _ = COMMANDS[task]
-    getattr(import_module(f"src.scripts.{module}"), entry)(args[1:])
+    package = "src" if module.startswith("ml.") else "src.scripts"
+    getattr(import_module(f"{package}.{module}"), entry)(args[1:])
 
 
 if __name__ == "__main__":

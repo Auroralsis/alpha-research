@@ -11,7 +11,26 @@
       "min_child_weight": [1, 10]
     }
   },
+  "rank_pair_tpe": {
+    "trials": 48,
+    "trials_per_ranker": 128,
+    "startup_trials": 12,
+    "lightgbm": {
+      "learning_rate": ["log", 0.01, 0.15], "max_depth": ["int", 4, 14],
+      "num_leaves": ["int_log", 16, 512], "lambda_l1": ["log", 1e-8, 1e4],
+      "lambda_l2": ["log", 1e-8, 1e4], "feature_fraction": ["float", 0.4, 1.0],
+      "bagging_fraction": ["float", 0.4, 1.0], "bagging_freq": ["int", 1, 7],
+      "min_data_in_leaf": ["int_log", 20, 240]
+    },
+    "xgboost": {
+      "learning_rate": ["log", 0.01, 0.15], "max_depth": ["int", 3, 12],
+      "min_child_weight": ["log", 1, 30], "reg_alpha": ["log", 1e-8, 1e4],
+      "reg_lambda": ["log", 1e-8, 1e4], "subsample": ["float", 0.4, 1.0],
+      "colsample_bytree": ["float", 0.4, 1.0]
+    }
+  },
   "rank_pair_tuning": {
+    "selection_loss": "lambdarank",
     "stages": ["depth", "leaves", "min_child", "l1", "l2", "row_sampling", "column_sampling"],
     "depth": [3, 5, 7],
     "leaf_cap_fractions": [0.5],
@@ -21,11 +40,6 @@
     "l2": [30, 200],
     "row_sampling": [0.65, 1.0],
     "column_sampling": [0.35, 0.7]
-  },
-  "catboost_tuning": {
-    "search_space": {
-      "l2_leaf_reg": [100, 300, 1000]
-    }
   },
   "ridge_strong_alphas": [10000, 100000, 1000000, 10000000, 100000000],
   "multiclass_pair_blend": {"weight_step_percent": 2},

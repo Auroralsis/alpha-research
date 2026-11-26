@@ -14,8 +14,8 @@ BASES = ("top50", "top100", "avoid50", "avoid100")
 METHODS = (*BASES, "linear", "equal", "logistic")
 
 
-def fixed_grades(frame: pd.DataFrame, *, split_top25: bool = False) -> pd.Series:
-    """按每日真实名次划档，可将前50细分为前25与第26–50，边界并列同档。"""
+def fixed_grades(frame: pd.DataFrame) -> pd.Series:
+    """按每日真实名次划档，边界并列同档。"""
     group = frame.groupby("trade_date").label
     high = group.rank(method="min", ascending=False)
     low = group.rank(method="min")
@@ -23,14 +23,14 @@ def fixed_grades(frame: pd.DataFrame, *, split_top25: bool = False) -> pd.Series
         raise ValueError("前后100名出现重叠，无法定义互斥标签")
     grades = pd.Series(np.select([low.le(50), low.le(100), high.le(50), high.le(100)],
                                  [0, 1, 4, 3], default=2), index=frame.index, dtype="int8")
-    return grades.mask(high.le(25), 5) if split_top25 else grades
+    return grades
 
 
-def read_period(source: Path, bounds: list[str], *, split_top25: bool = False) -> pd.DataFrame:
+def read_period(source: Path, bounds: list[str], cfg=None) -> pd.DataFrame:
     """按信号日读全股票池，仅对收益终点也落入本期的股票生成标签。"""
-    frame = read_feature_split(source / "features.parquet", bounds, "排名实验").sort_values(["trade_date", "ticker"])
+    frame = read_feature_split(source / "features.parquet", bounds, "排名实验", cfg).sort_values(["trade_date", "ticker"])
     frame["evaluable"] = segment_masks(frame, {"period": bounds})["period"]
-    frame["grade"] = fixed_grades(frame.loc[frame.evaluable], split_top25=split_top25).reindex(frame.index).astype("Int8")
+    frame["grade"] = fixed_grades(frame.loc[frame.evaluable]).reindex(frame.index).astype("Int8")
     return frame
 
 
@@ -69,20 +69,42 @@ def check_grades(rows, period, archived):
     return counts.sum(axis=1).to_numpy()
 
 
-def training_periods(source, reference, segments, *, split_top25=False):
+def training_periods(source, reference, segments, early_stop=None, cfg=None):
     """逐段读取训练与早停样本，按归档核对交易日、标签边界和分档人数。"""
+    if early_stop is not None:
+        for name, bounds in (("train", segments["train"]), ("early_stop", early_stop)):
+            frame = read_period(source, bounds, cfg=cfg)
+            rows = frame.loc[frame.evaluable]
+            yield name, rows, rows.groupby("trade_date", sort=False).size().to_numpy()
+        return
     periods, counts = archive_periods(reference, segments)
     for period in periods:
-        frame = read_period(source, [period["start"], period["end"]], split_top25=split_top25)
+        frame = read_period(source, [period["start"], period["end"]], cfg=cfg)
         rows = frame.loc[frame.evaluable]
         del frame
-        yield period["period"], rows, check_grades(rows, period, counts)
+        sizes = (rows.groupby("trade_date", sort=False).size().to_numpy() if cfg and cfg.get("label_end_days", 2) != 2
+                 else check_grades(rows, period, counts))
+        yield period["period"], rows, sizes
         del rows
 
 
 def equal_ranks(frame, columns):
     """先在全部打分股票上逐日取百分位，再给各目标相同权重。"""
     return frame.groupby("trade_date")[columns].rank(pct=True).mean(axis=1)
+
+
+def fuse_rankers(frame, columns, mode="percentile"):
+    """用同日截面的原始预测做标准化，四个排序目标等权。"""
+    if mode == "percentile":
+        return equal_ranks(frame, columns)
+    if mode != "zscore":
+        raise ValueError(f"未知的排序器融合方式 {mode}")
+    values = frame[columns].astype("float64")
+    if not np.isfinite(values).all().all():
+        raise ValueError("排序器原始预测缺分")
+    groups = values.groupby(frame.trade_date)
+    std = groups.transform("std", ddof=1)
+    return ((values - groups.transform("mean")) / std.where(std.gt(0))).fillna(0.).mean(axis=1)
 
 
 def validation_loss(frame, score, gains, k):
@@ -135,3 +157,22 @@ def selection_stats(scores: pd.DataFrame, methods: tuple[str, ...] = METHODS) ->
         pieces.append(flags.groupby(["split", "trade_date"])[["hit50", "hit100", "bottom50", "bottom100", "label"]]
                       .mean().rename(columns={"label": "top_return"}).assign(strategy=name))
     return pd.concat(pieces).reset_index()
+
+
+def bottom_members(frame: pd.DataFrame, k: int) -> pd.Series:
+    """按信号日识别真实收益最低的 k 只，边界并列全部计入。"""
+    return frame.groupby("trade_date").label.rank(method="min").le(k)
+
+
+def holding_bottom_rates(holdings: pd.DataFrame, scores: pd.DataFrame, dates: pd.DatetimeIndex, k: int) -> pd.DataFrame:
+    """用 T 日标签评价 T+1 收盘实持股票，逐日保留可评价及全部持仓数。"""
+    ranked = scores.loc[scores.evaluable, ["trade_date", "ticker", "label"]].copy()
+    ranked["bottom"] = bottom_members(ranked, k)
+    execution = pd.Series(dates[1:], index=dates[:-1])
+    ranked["trade_date"] = ranked.trade_date.map(execution)
+    held = holdings.loc[holdings.amount.gt(0)].merge(ranked[["trade_date", "ticker", "bottom"]],
+                                                     on=["trade_date", "ticker"], how="left", validate="many_to_one")
+    daily = held.groupby(["strategy", "offset", "trade_date"]).bottom.agg(
+        held="size", evaluable="count", in_bottom="sum").reset_index()
+    daily["held_bottom_rate"] = daily.in_bottom / daily.evaluable.where(daily.evaluable.gt(0))
+    return daily

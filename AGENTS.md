@@ -2,6 +2,8 @@
 
 项目用历史动态中证500股票池比较六种打分方法。固定 LightGBM、滚动 LightGBM 和 Ridge 从 Alpha158 学习分数，Alpha3、Alpha13、Alpha44 用复权量价计算分数并做行业、市值中性化。六种分数进入同一套评价和 Qlib Top-K 回测，中证500价格指数是组合基准。
 
+代码注释和文档字符串统一使用中文，函数名、参数名、模型名和指标名沿用代码中的写法。
+
 ## 沿一条信号读代码
 
 默认配置在 [configs/research.json](configs/research.json)，调参网格和联合搜索阶段在 [configs/tuning.json](configs/tuning.json)，读取入口在 [src/config.py](src/config.py)。阅读时先看 `run_all.main()` 怎样准备数据并生成预测，再看同文件的 `evaluate_predictions()` 怎样依次计算 IC、回测和写报告。
@@ -12,8 +14,8 @@
 | [factors](src/factors) · 因子 | [factor_batches()](src/factors/__init__.py) 接收行情面板、成员和信号日，分批返回含 `trade_date`、`ticker` 的因子长表。`alpha158` 用 Qlib 官方表达式，`price_volume` 用项目约定的成分股截面排名计算 Alpha3、Alpha13、Alpha44 等。[neutralization.py](src/factors/neutralization.py) 做行业、市值中性化。 |
 | [ml](src/ml) · 模型预测 | [dataset.py](src/ml/dataset.py) 将 Alpha158 与标签对齐，组装 Qlib 拟合样本。[models.py](src/ml/models.py)、[rolling.py](src/ml/rolling.py) 生成固定和滚动预测，[tuning.py](src/ml/tuning.py) 按验证 MSE 搜参。 |
 | [backtest](src/backtest) · 评价与回测 | 股票日分数 → IC、五组收益、回归、交易账本。[engine.py](src/backtest/engine.py) 为各方法运行 Qlib Top-K，[factor_metrics.py](src/backtest/factor_metrics.py) 计算 IC、分组收益和回归，[portfolio.py](src/backtest/portfolio.py) 从账本计算全期及逐窗绩效。 |
-| [report](src/report) · 报告 | [research.py](src/report/research.py) 的 `write_results()` 生成策略比较报告，`write_alpha101_report()` 生成因子排名报告，二者共用表格格式和编号，[charts.py](src/report/charts.py) 绘图，[strategy_report.md](src/report/strategy_report.md) 存放报告正文模板；复现清单由 `research.write_manifest()` 生成。 |
-| [scripts](src/scripts) · 运行 | [任务命令表](src/scripts/__main__.py) 连接各任务入口。[run_all.py](src/scripts/run_all.py) 负责综合研究和固定 LightGBM，[factors.py](src/scripts/factors.py) 负责因子检验、特征对照与等权，[boosting.py](src/scripts/boosting.py) 负责 XGBoost、CatBoost 和混合验证。 |
+| [report](src/report) · 报告 | [research.py](src/report/research.py) 的 `write_results()` 生成策略比较报告，[charts.py](src/report/charts.py) 绘图，[strategy_report.md](src/report/strategy_report.md) 存放报告正文模板；复现清单由 `research.write_manifest()` 生成。 |
+| [scripts](src/scripts) · 运行 | [任务命令表](src/scripts/__main__.py) 连接各任务入口。[run_all.py](src/scripts/run_all.py) 负责综合研究和固定 LightGBM，[train_xgboost.py](src/scripts/train_xgboost.py) 负责独立 XGBoost，八模型见 [train_eight_rankers.py](src/scripts/train_eight_rankers.py)。 |
 
 ## 容易改变结果的口径
 
@@ -27,16 +29,17 @@
 
 使用已有 Conda 环境 `quant`，依赖见 [requirements.txt](requirements.txt)。在仓库根目录运行。
 
+每次启动训练都使用已有的 tmux 会话 `train`，在其中新开窗口运行，方便通过 `tmux attach -t train` 查看进度。
+
 | 任务 | 命令 |
 | --- | --- |
 | 完整比较六种方法 | `python -B -m src.scripts study` |
-| 仅固定 LightGBM 与指数 | `python -B -m src.scripts lightgbm` |
+| 仅固定 LightGBM 与指数 | `python -B -m src.scripts lightgbm --loss mse` |
 | 按验证集 MSE 网格调参 | `python -B -m src.scripts study --stage tune` |
 | 复用已有预测，重新评价、回测并写报告 | `python -B -m src.scripts study --stage evaluate --out <实验目录>` |
-| 全部 Alpha101 原始及中性化单因子 IC 研究 | `python -B -m src.scripts alpha101`。公式在 [alpha101.py](src/factors/alpha101.py)，逐日评价在 [factor_metrics.py](src/backtest/factor_metrics.py)，报告在 `docs/factors/alpha101_ic_daily.md`。 |
 | 回归测试 | `python -B -m unittest discover -s tests -v` |
 
-[run_lambdarank.py](src/scripts/run_lambdarank.py) 比较排序目标，[run_rank_stack.py](src/scripts/run_rank_stack.py) 组织堆叠、等权与六档实验，[run_pair_tuning.py](src/scripts/run_pair_tuning.py) 联合调参。[run_listfold.py](src/scripts/run_listfold.py) 运行 ListFold 和四目标 MLP，`listfold --model mlp-ndcg` 训练四个网络。网络实现在 [listfold.py](src/ml/listfold.py)，排序样本和评价在 [rank_validation.py](src/ml/rank_validation.py)，回测由 [engine.py](src/backtest/engine.py) 的 `evaluate_signals()` 串联。旧命令转发位于 [legacy](src/scripts/legacy)。
+四个训练入口为 [MLP](src/scripts/train_mlp.py)、[LightGBM](src/scripts/train_lightgbm.py)、[XGBoost](src/scripts/train_xgboost.py) 和 [八等权排序器](src/scripts/train_eight_rankers.py)。树排序模型共用 [tree_experiment.py](src/ml/tree_experiment.py) 的拟合与选参流程，神经网络见 [mlp.py](src/ml/mlp.py)。训练目标在模型入口选择，选参指标由 `--tpe-objective` 控制。
 
 单因子排名、缺分规则对照和中性化分析写入 `results/factors/`，因子报告在 `docs/factors/`。综合回测、LightGBM 调参、Ridge 和等权组合共用 `results/ml_study/`。完整实验写入 `results/ml_study/<频率>_<时间戳>/`。复查时先看该次的 `config.json` 和 `manifest.json`，再按问题查 `predictions.parquet`、`daily_rank_ic.csv`、`ledger.parquet` 或 `portfolio_metrics.csv`。评价命令会更新指定实验的产物和对应频率的报告。综合报告在 `docs/results/ml_study_<频率>.md`，单模型报告在 `docs/results/lightgbm_study_<频率>.md`。调参单独写入 `tuning_<时间戳>/`。`results/` 仅保存在本地。
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.config import fixed_validation, validation_argument
 from src.backtest.engine import run_backtests
 from src.backtest.portfolio import QLIB_DAILY_ANNUALIZATION, qlib_excess_metrics
 from src.data.factor_disclosures import CACHE
@@ -15,7 +16,7 @@ from src.factors.neutralization import mad_clip
 from src.ml.dataset import alpha158_columns
 from src.ml.rank_validation import BASES, equal_ranks, training_periods
 from src.scripts.run_all import RUNS, new_run
-from src.scripts.run_pair_tuning import quantile_matrices, train_candidate
+from src.ml.tree_experiment import quantile_matrices, train_candidate
 from src.report.research import markdown_table
 
 BASE = RUNS / "daily_pair_tuning_20261122_100328_550844"
@@ -172,7 +173,7 @@ def report(out):
 
 [量价因子来源](https://rodneywhitecenter.wharton.upenn.edu/wp-content/uploads/2018/10/01-18.Stambaugh.pdf) · [财报因子附录](https://pubsonline.informs.org/doi/suppl/10.1287/mnsc.2023.4904/suppl_file/mnsc.2023.4904.sm1.pdf) · [限价研究](https://doi.org/10.1016/j.frl.2023.104803)
 """
-    (out/"report.md").write_text("# Alpha158 单列增量实验\n\n2014–2020 年拟合，2021 年早停，沿用 2022 年确定的参数。"
+    (out/"report.md").write_text("# Alpha158 单列增量实验\n\n2014–2020 年拟合，按配置区间早停，沿用 2022 年确定的参数。"
         "固定八排序器按逐日排名百分位等权，2023–2025 年历史成分，复权收盘交易，Top50 每日计划替换 5 只，买 5 bp、卖 15 bp。"
         "新增列单独按当日模型样本做 5 MAD 截尾，缺失保留。费用后日收益减价格指数日收益按 Qlib sum 模式计算，年化基数 238。\n\n"
         +finding+"\n\n表 1　回测绩效\n\n"+table+"\n\n表 2　逐年新增列覆盖率（有效值数 / 原 Alpha158 股票日数）\n\n"+cov_table+"\n\n"+note)
@@ -209,7 +210,7 @@ def train_feature_set(folder, strategy, extra_name, values, features, cfg, winne
         x[extra_name] = values.reindex(pd.MultiIndex.from_frame(rows[KEY])).to_numpy()
         return x
     blocks = []
-    for _, rows, groups in training_periods(source,Path(cfg["reference"]),cfg["segments"]):
+    for _, rows, groups in training_periods(source,Path(cfg["reference"]),cfg["segments"], cfg.get("early_stop_bounds"), cfg):
         blocks.append((matrix(rows),rows.grade.to_numpy(dtype=int),groups))
         del rows
     if blocks[0][0][extra_name].nunique() < 2:
@@ -244,12 +245,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out",type=Path)
     parser.add_argument("factors", nargs="*", default=["nPLHR"])
+    validation_argument(parser)
     args = parser.parse_args()
     if set(args.factors)-set(FACTORS):
         parser.error("可选因子 " + ", ".join(FACTORS))
     out = args.out or new_run(1,tag="alpha159")
     out.mkdir(parents=True,exist_ok=True)
     cfg = json.loads((BASE/"config.json").read_text())
+    fixed_validation(cfg, args.validation_mode)
     winners = json.loads((BASE/"winners.json").read_text())
     config_path = out / "config.json"
     frozen = {**cfg, **winners}
